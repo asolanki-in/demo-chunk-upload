@@ -1,137 +1,97 @@
-import java.io.*;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.Arrays;
+#!/bin/bash
 
-public class MJPEGStreamParser {
-    private static final byte[] JPEG_START_MARKER = new byte[]{(byte) 0xFF, (byte) 0xD8};
-    private static final byte[] JPEG_END_MARKER = new byte[]{(byte) 0xFF, (byte) 0xD9};
-    private static final String BOUNDARY_MARKER = "--";
-    
-    private final String streamUrl;
-    private final String outputDirectory;
-    private boolean isRunning;
-    private int frameCount;
+# Configuration
+OUTPUT_DIR="launch_traces"
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-    public MJPEGStreamParser(String streamUrl, String outputDirectory) {
-        this.streamUrl = streamUrl;
-        this.outputDirectory = outputDirectory;
-        this.frameCount = 0;
-        
-        try {
-            Files.createDirectories(Paths.get(outputDirectory));
-        } catch (IOException e) {
-            throw new RuntimeException("Failed to create output directory: " + e.getMessage());
-        }
-    }
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
 
-    public void start() {
-        isRunning = true;
-        try {
-            URL url = new URL(streamUrl);
-            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-            connection.setRequestMethod("GET");
-            
-            try (InputStream inputStream = connection.getInputStream()) {
-                processStream(inputStream);
-            }
-        } catch (IOException e) {
-            throw new RuntimeException("Error connecting to stream: " + e.getMessage());
-        }
-    }
-
-    private void processStream(InputStream inputStream) throws IOException {
-        ByteArrayOutputStream imageBuffer = new ByteArrayOutputStream();
-        byte[] buffer = new byte[8192];
-        int bytesRead;
-        boolean foundJPEGStart = false;
-        
-        while (isRunning && (bytesRead = inputStream.read(buffer)) != -1) {
-            for (int i = 0; i < bytesRead; i++) {
-                // Look for JPEG start marker
-                if (!foundJPEGStart && i < bytesRead - 1) {
-                    if (buffer[i] == JPEG_START_MARKER[0] && buffer[i + 1] == JPEG_START_MARKER[1]) {
-                        imageBuffer.reset();
-                        foundJPEGStart = true;
-                        imageBuffer.write(buffer, i, 2);
-                        i++;
-                        continue;
-                    }
-                }
-                
-                // If we're collecting JPEG data
-                if (foundJPEGStart) {
-                    imageBuffer.write(buffer[i]);
-                    
-                    // Look for JPEG end marker
-                    if (i > 0 && buffer[i - 1] == JPEG_END_MARKER[0] && buffer[i] == JPEG_END_MARKER[1]) {
-                        saveFrame(imageBuffer.toByteArray());
-                        foundJPEGStart = false;
-                        imageBuffer.reset();
-                    }
-                }
-            }
-        }
-    }
-
-    private void saveFrame(byte[] imageData) {
-        try {
-            // Create unique filename using timestamp and frame counter
-            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
-            String filename = String.format("frame_%s_%04d.jpg", timestamp, frameCount++);
-            Path outputPath = Paths.get(outputDirectory, filename);
-
-            // Write the raw JPEG data directly to file
-            Files.write(outputPath, imageData);
-            System.out.println("Saved frame: " + filename + " (Size: " + imageData.length + " bytes)");
-            
-            // Verify the file was written correctly
-            if (Files.size(outputPath) > 0) {
-                System.out.println("Frame saved successfully");
-            } else {
-                System.err.println("Warning: Saved frame has zero size");
-            }
-        } catch (IOException e) {
-            System.err.println("Error saving frame: " + e.getMessage());
-        }
-    }
-
-    public void stop() {
-        isRunning = false;
-    }
-
-    // Utility method to check if byte array starts with pattern
-    private boolean startsWith(byte[] array, byte[] pattern) {
-        if (array.length < pattern.length) {
-            return false;
-        }
-        for (int i = 0; i < pattern.length; i++) {
-            if (array[i] != pattern[i]) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    // Example usage
-    public static void main(String[] args) {
-        String streamUrl = "http://localhost:9100";
-        String outputDir = "frames";
-        
-        MJPEGStreamParser parser = new MJPEGStreamParser(streamUrl, outputDir);
-        
-        // Add shutdown hook to stop parser gracefully
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("Shutting down parser...");
-            parser.stop();
-        }));
-        
-        System.out.println("Starting MJPEG stream parser...");
-        parser.start();
-    }
+# Function to get available devices
+list_devices() {
+    echo -e "${BLUE}Available devices:${NC}"
+    xcrun xctrace list devices
 }
+
+# Function to measure launch time
+measure_launch_time() {
+    local app_path="$1"
+    local device_id="$2"
+    local bundle_id="$3"
+    local timestamp=$(date +"%Y%m%d_%H%M%S")
+    local trace_file="$OUTPUT_DIR/launch_trace_${timestamp}.trace"
+
+    echo -e "${GREEN}Starting measurement...${NC}"
+    echo -e "${BLUE}App: $bundle_id${NC}"
+    echo -e "${BLUE}Device: $device_id${NC}"
+    echo -e "${BLUE}Output: $trace_file${NC}"
+
+    # Terminate app if running
+    if [[ "$device_id" == "booted" ]]; then
+        xcrun simctl terminate "$device_id" "$bundle_id" 2>/dev/null
+    fi
+
+    # Record launch trace
+    xcrun xctrace record \
+        --device "$device_id" \
+        --template 'App Launch' \
+        --output "$trace_file" \
+        --launch "$app_path" \
+        --time-limit 10s \
+        --maximum-samples 10
+
+    echo -e "${GREEN}Measurement complete${NC}"
+    echo -e "${BLUE}Analyzing trace file...${NC}"
+
+    # Analyze the trace file
+    xcrun xctrace analyze "$trace_file"
+}
+
+# Function to get bundle ID from app
+get_bundle_id() {
+    local app_path="$1"
+    /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app_path/Info.plist"
+}
+
+# Main script
+main() {
+    echo -e "${GREEN}iOS App Launch Time Profiler using xctrace${NC}"
+    echo -e "${GREEN}======================================${NC}"
+
+    # Check if app path is provided
+    if [ "$#" -ne 1 ]; then
+        echo "Usage: $0 <path-to-app>"
+        exit 1
+    fi
+
+    APP_PATH="$1"
+
+    # Verify app path exists
+    if [ ! -d "$APP_PATH" ]; then
+        echo "Error: App path does not exist: $APP_PATH"
+        exit 1
+    fi
+
+    # Get bundle ID
+    BUNDLE_ID=$(get_bundle_id "$APP_PATH")
+    if [ -z "$BUNDLE_ID" ]; then
+        echo "Error: Could not extract bundle identifier"
+        exit 1
+    fi
+
+    # List available devices
+    list_devices
+
+    # Get device selection
+    read -p "Enter device ID (or press enter for booted simulator): " DEVICE_ID
+    DEVICE_ID=${DEVICE_ID:-"booted"}
+
+    # Run measurement
+    measure_launch_time "$APP_PATH" "$DEVICE_ID" "$BUNDLE_ID"
+
+    echo -e "\n${GREEN}Trace files are saved in $OUTPUT_DIR directory${NC}"
+}
+
+main "$@"
