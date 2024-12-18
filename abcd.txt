@@ -1,0 +1,161 @@
+#!/bin/bash
+
+# Configuration
+ITERATIONS=3
+OUTPUT_FILE="launch_times.txt"
+TRACE_DIR="traces"
+
+# Colors for output
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Create directories
+mkdir -p "$TRACE_DIR"
+
+# Function to get connected devices
+get_devices() {
+    xcrun xctrace list devices 2>/dev/null
+}
+
+# Function to extract bundle ID from app
+get_bundle_id() {
+    local app_path="$1"
+    /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app_path/Info.plist"
+}
+
+# Function to measure launch time using xctrace
+measure_with_xctrace() {
+    local app_path="$1"
+    local device_id="$2"
+    local iteration="$3"
+    local bundle_id="$4"
+    
+    echo -e "${BLUE}Running measurement $iteration...${NC}"
+    
+    # Create unique trace file
+    trace_file="$TRACE_DIR/trace_${iteration}.trace"
+    
+    # Kill existing instance of the app
+    xcrun simctl terminate "$device_id" "$bundle_id" 2>/dev/null
+    
+    # Clear app data
+    xcrun simctl uninstall "$device_id" "$bundle_id" 2>/dev/null
+    xcrun simctl install "$device_id" "$app_path" 2>/dev/null
+    
+    # Run xctrace
+    xctrace record --device "$device_id" \
+            --template 'Time Profiler' \
+            --output "$trace_file" \
+            --launch "$app_path" \
+            --terminate \
+            --time-limit 10s \
+            2>/dev/null
+    
+    # Extract launch time data using xctrace
+    launch_data=$(xctrace examine --input "$trace_file" --tool 'Time Profiler' 2>/dev/null)
+    
+    # Parse and store launch time
+    launch_time=$(echo "$launch_data" | grep -A 5 "Main Thread" | grep "Total Time" | awk '{print $4}')
+    if [ ! -z "$launch_time" ]; then
+        echo "Launch $iteration: ${launch_time}ms" >> "$OUTPUT_FILE"
+    fi
+}
+
+# Function to measure using modern simctl
+measure_with_simctl() {
+    local bundle_id="$1"
+    local device_id="$2"
+    local iteration="$3"
+    
+    echo -e "${BLUE}Running measurement $iteration...${NC}"
+    
+    # Clear app state
+    xcrun simctl terminate "$device_id" "$bundle_id" 2>/dev/null
+    sleep 2
+    
+    # Measure launch
+    start_time=$(gdate +%s%N 2>/dev/null || date +%s%N)
+    xcrun simctl launch "$device_id" "$bundle_id" 2>/dev/null
+    end_time=$(gdate +%s%N 2>/dev/null || date +%s%N)
+    
+    # Calculate duration in milliseconds
+    duration=$(( ($end_time - $start_time) / 1000000 ))
+    echo "Launch $iteration: ${duration}ms" >> "$OUTPUT_FILE"
+}
+
+# Function to check Xcode version
+check_xcode_version() {
+    xcodebuild -version | head -n 1 | grep -o "[0-9]*\.[0-9]*"
+}
+
+# Main script
+main() {
+    echo -e "${GREEN}iOS App Launch Time Profiler (Xcode 15/16)${NC}"
+    echo -e "${GREEN}=====================================${NC}"
+    
+    # Check if IPA/app path provided
+    if [ "$#" -ne 1 ]; then
+        echo "Usage: $0 <path-to-app-or-ipa>"
+        exit 1
+    fi
+    
+    # Check Xcode version
+    XCODE_VERSION=$(check_xcode_version)
+    echo -e "${GREEN}Detected Xcode version: $XCODE_VERSION${NC}"
+    
+    APP_PATH="$1"
+    
+    # Verify app path exists
+    if [ ! -d "$APP_PATH" ]; then
+        echo "Error: App path does not exist: $APP_PATH"
+        exit 1
+    }
+    
+    # Extract bundle identifier
+    BUNDLE_ID=$(get_bundle_id "$APP_PATH")
+    if [ -z "$BUNDLE_ID" ]; then
+        echo "Error: Could not extract bundle identifier"
+        exit 1
+    }
+    
+    echo -e "${GREEN}Testing app: $BUNDLE_ID${NC}"
+    echo -e "${GREEN}Available devices:${NC}"
+    get_devices
+    
+    read -p "Enter device ID (or press enter for booted simulator): " DEVICE_ID
+    DEVICE_ID=${DEVICE_ID:-"booted"}
+    
+    # Clear previous results
+    rm -f "$OUTPUT_FILE"
+    rm -rf "$TRACE_DIR"/*
+    
+    echo -e "${GREEN}Starting measurements...${NC}"
+    echo "Launch Time Results for $BUNDLE_ID" > "$OUTPUT_FILE"
+    echo "=================================" >> "$OUTPUT_FILE"
+    echo "Xcode Version: $XCODE_VERSION" >> "$OUTPUT_FILE"
+    echo "Date: $(date)" >> "$OUTPUT_FILE"
+    echo "=================================" >> "$OUTPUT_FILE"
+    
+    for i in $(seq 1 $ITERATIONS); do
+        if [[ "$DEVICE_ID" == "booted" || "$DEVICE_ID" =~ "simulator" ]]; then
+            measure_with_simctl "$BUNDLE_ID" "$DEVICE_ID" "$i"
+        else
+            measure_with_xctrace "$APP_PATH" "$DEVICE_ID" "$i" "$BUNDLE_ID"
+        fi
+        
+        # Wait between iterations
+        sleep 5
+    done
+    
+    # Calculate average
+    average=$(awk '/Launch/ {sum+=$3; count++} END {print sum/count}' "$OUTPUT_FILE")
+    echo -e "\nAverage launch time: ${average}ms" >> "$OUTPUT_FILE"
+    
+    echo -e "${GREEN}Measurements complete. Results saved in $OUTPUT_FILE${NC}"
+    cat "$OUTPUT_FILE"
+    
+    echo -e "\n${GREEN}Trace files are saved in $TRACE_DIR directory${NC}"
+}
+
+main "$@"
