@@ -294,3 +294,185 @@
     </script>
 </body>
 </html>
+
+
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stream Viewer</title>
+    <style>
+        .container {
+            max-width: 1200px;
+            margin: 20px auto;
+            padding: 20px;
+        }
+        .stream-container {
+            background: #f0f0f0;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .stream-image {
+            max-width: 100%;
+            height: auto;
+        }
+        .debug-info {
+            background: #eee;
+            padding: 10px;
+            margin: 10px 0;
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
+        .controls {
+            margin: 10px 0;
+        }
+        button {
+            padding: 8px 16px;
+            margin: 0 5px;
+        }
+        #status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .connected { background: #d4edda; }
+        .disconnected { background: #f8d7da; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Stream Viewer</h1>
+        
+        <div class="controls">
+            <button onclick="startStream()">Start Stream</button>
+            <button onclick="stopStream()">Stop Stream</button>
+            <button onclick="toggleDebug()">Toggle Debug Info</button>
+        </div>
+
+        <div id="status">Status: Disconnected</div>
+        
+        <div class="stream-container">
+            <img id="streamImage" class="stream-image" alt="Stream"/>
+        </div>
+
+        <div id="debugInfo" class="debug-info" style="display: none;"></div>
+    </div>
+
+    <script>
+        let eventSource = null;
+        let frameCount = 0;
+        let lastFrameTime = Date.now();
+        let debugMode = false;
+
+        function updateDebugInfo(info) {
+            if (!debugMode) return;
+            const debugDiv = document.getElementById('debugInfo');
+            debugDiv.textContent = JSON.stringify(info, null, 2);
+        }
+
+        function toggleDebug() {
+            debugMode = !debugMode;
+            document.getElementById('debugInfo').style.display = debugMode ? 'block' : 'none';
+        }
+
+        function updateStatus(connected, message) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.className = connected ? 'connected' : 'disconnected';
+            statusDiv.textContent = message;
+        }
+
+        function startStream() {
+            if (eventSource) {
+                stopStream();
+            }
+
+            const img = document.getElementById('streamImage');
+            frameCount = 0;
+            lastFrameTime = Date.now();
+
+            try {
+                eventSource = new EventSource('/api/stream/video');
+
+                eventSource.onopen = function() {
+                    console.log('Stream connected');
+                    updateStatus(true, 'Status: Connected');
+                };
+
+                eventSource.onmessage = function(event) {
+                    try {
+                        // Calculate FPS
+                        frameCount++;
+                        const currentTime = Date.now();
+                        const elapsed = (currentTime - lastFrameTime) / 1000;
+                        const fps = Math.round(frameCount / elapsed);
+
+                        // Convert the received data to an image
+                        const blob = new Blob([event.data], { type: 'image/jpeg' });
+                        const imageUrl = URL.createObjectURL(blob);
+
+                        // Update debug info
+                        updateDebugInfo({
+                            frameSize: event.data.length,
+                            totalFrames: frameCount,
+                            fps: fps,
+                            timestamp: new Date().toISOString()
+                        });
+
+                        // Load the image
+                        img.onload = function() {
+                            URL.revokeObjectURL(imageUrl); // Clean up
+                        };
+                        img.onerror = function() {
+                            console.error('Failed to load image');
+                            updateDebugInfo({
+                                error: 'Image load failed',
+                                dataSize: event.data.length,
+                                timestamp: new Date().toISOString()
+                            });
+                        };
+                        img.src = imageUrl;
+
+                    } catch (error) {
+                        console.error('Error processing frame:', error);
+                        updateDebugInfo({
+                            error: error.message,
+                            timestamp: new Date().toISOString()
+                        });
+                    }
+                };
+
+                eventSource.onerror = function(error) {
+                    console.error('Stream error:', error);
+                    updateStatus(false, 'Status: Error - Reconnecting...');
+                    updateDebugInfo({
+                        error: 'Stream connection error',
+                        timestamp: new Date().toISOString()
+                    });
+                };
+
+            } catch (error) {
+                console.error('Failed to create EventSource:', error);
+                updateStatus(false, 'Status: Failed to connect');
+            }
+        }
+
+        function stopStream() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+                updateStatus(false, 'Status: Disconnected');
+            }
+        }
+
+        // Optional: Start stream automatically
+        // window.addEventListener('load', startStream);
+
+        // Clean up on page unload
+        window.addEventListener('beforeunload', stopStream);
+    </script>
+</body>
+</html>
