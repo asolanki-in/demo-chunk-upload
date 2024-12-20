@@ -1,97 +1,144 @@
-#!/bin/bash
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.stereotype.Service;
+import org.springframework.stereotype.Component;
 
-# Configuration
-OUTPUT_DIR="launch_traces"
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+import javax.annotation.PreDestroy;
+import java.io.BufferedInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.concurrent.*;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Collections;
+import java.util.HashSet;
 
-# Create output directory
-mkdir -p "$OUTPUT_DIR"
+@Component
+class MjpegFrameProcessor {
+    private static final int BUFFER_SIZE = 8192;
+    private final AtomicBoolean isRunning = new AtomicBoolean(true);
+    private final Set<SseEmitter> emitters = Collections.synchronizedSet(new HashSet<>());
+    private final ExecutorService executorService;
+    private Future<?> processorFuture;
 
-# Function to get available devices
-list_devices() {
-    echo -e "${BLUE}Available devices:${NC}"
-    xcrun xctrace list devices
+    public MjpegFrameProcessor() {
+        // Use a single thread for frame processing to avoid overwhelming the system
+        this.executorService = Executors.newSingleThreadExecutor();
+    }
+
+    public void startProcessing(String streamUrl) {
+        processorFuture = executorService.submit(() -> {
+            while (isRunning.get()) {
+                try {
+                    byte[] frame = captureFrame(streamUrl);
+                    if (frame != null) {
+                        broadcast(frame);
+                    }
+                } catch (IOException e) {
+                    // Log error and possibly implement retry logic
+                    e.printStackTrace();
+                }
+            }
+        });
+    }
+
+    private byte[] captureFrame(String streamUrl) throws IOException {
+        URL url = new URL(streamUrl);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        try (InputStream is = new BufferedInputStream(conn.getInputStream())) {
+            // Read MJPEG frame boundary
+            String boundary = findBoundary(is);
+            if (boundary == null) return null;
+
+            // Read frame content
+            return readFrameContent(is, boundary);
+        }
+    }
+
+    private String findBoundary(InputStream is) throws IOException {
+        // Implementation to find MJPEG boundary marker
+        // This is a simplified version - you'll need to implement proper boundary detection
+        return "--myboundary";
+    }
+
+    private byte[] readFrameContent(InputStream is, String boundary) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        byte[] buffer = new byte[BUFFER_SIZE];
+        int bytesRead;
+        
+        while ((bytesRead = is.read(buffer)) != -1) {
+            baos.write(buffer, 0, bytesRead);
+            // Check if we've reached the boundary
+            if (new String(baos.toByteArray()).contains(boundary)) {
+                break;
+            }
+        }
+        
+        return baos.toByteArray();
+    }
+
+    public SseEmitter addEmitter() {
+        SseEmitter emitter = new SseEmitter(Long.MAX_VALUE);
+        emitters.add(emitter);
+        
+        emitter.onCompletion(() -> emitters.remove(emitter));
+        emitter.onTimeout(() -> emitters.remove(emitter));
+        emitter.onError(e -> emitters.remove(emitter));
+        
+        return emitter;
+    }
+
+    private void broadcast(byte[] frame) {
+        Set<SseEmitter> deadEmitters = new HashSet<>();
+        
+        emitters.forEach(emitter -> {
+            try {
+                emitter.send(frame, MediaType.IMAGE_JPEG);
+            } catch (IOException e) {
+                deadEmitters.add(emitter);
+            }
+        });
+        
+        emitters.removeAll(deadEmitters);
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        isRunning.set(false);
+        if (processorFuture != null) {
+            processorFuture.cancel(true);
+        }
+        executorService.shutdown();
+    }
 }
 
-# Function to measure launch time
-measure_launch_time() {
-    local app_path="$1"
-    local device_id="$2"
-    local bundle_id="$3"
-    local timestamp=$(date +"%Y%m%d_%H%M%S")
-    local trace_file="$OUTPUT_DIR/launch_trace_${timestamp}.trace"
-
-    echo -e "${GREEN}Starting measurement...${NC}"
-    echo -e "${BLUE}App: $bundle_id${NC}"
-    echo -e "${BLUE}Device: $device_id${NC}"
-    echo -e "${BLUE}Output: $trace_file${NC}"
-
-    # Terminate app if running
-    if [[ "$device_id" == "booted" ]]; then
-        xcrun simctl terminate "$device_id" "$bundle_id" 2>/dev/null
-    fi
-
-    # Record launch trace
-    xcrun xctrace record \
-        --device "$device_id" \
-        --template 'App Launch' \
-        --output "$trace_file" \
-        --launch "$app_path" \
-        --time-limit 10s \
-        --maximum-samples 10
-
-    echo -e "${GREEN}Measurement complete${NC}"
-    echo -e "${BLUE}Analyzing trace file...${NC}"
-
-    # Analyze the trace file
-    xcrun xctrace analyze "$trace_file"
+@RestController
+@RequestMapping("/api/stream")
+class StreamController {
+    private final MjpegFrameProcessor frameProcessor;
+    
+    public StreamController(MjpegFrameProcessor frameProcessor) {
+        this.frameProcessor = frameProcessor;
+    }
+    
+    @GetMapping("/video")
+    public SseEmitter streamVideo() {
+        return frameProcessor.addEmitter();
+    }
 }
 
-# Function to get bundle ID from app
-get_bundle_id() {
-    local app_path="$1"
-    /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app_path/Info.plist"
+@Service
+class StreamService {
+    private final MjpegFrameProcessor frameProcessor;
+    
+    public StreamService(MjpegFrameProcessor frameProcessor) {
+        this.frameProcessor = frameProcessor;
+    }
+    
+    public void initializeStream(String streamUrl) {
+        frameProcessor.startProcessing(streamUrl);
+    }
 }
-
-# Main script
-main() {
-    echo -e "${GREEN}iOS App Launch Time Profiler using xctrace${NC}"
-    echo -e "${GREEN}======================================${NC}"
-
-    # Check if app path is provided
-    if [ "$#" -ne 1 ]; then
-        echo "Usage: $0 <path-to-app>"
-        exit 1
-    fi
-
-    APP_PATH="$1"
-
-    # Verify app path exists
-    if [ ! -d "$APP_PATH" ]; then
-        echo "Error: App path does not exist: $APP_PATH"
-        exit 1
-    fi
-
-    # Get bundle ID
-    BUNDLE_ID=$(get_bundle_id "$APP_PATH")
-    if [ -z "$BUNDLE_ID" ]; then
-        echo "Error: Could not extract bundle identifier"
-        exit 1
-    fi
-
-    # List available devices
-    list_devices
-
-    # Get device selection
-    read -p "Enter device ID (or press enter for booted simulator): " DEVICE_ID
-    DEVICE_ID=${DEVICE_ID:-"booted"}
-
-    # Run measurement
-    measure_launch_time "$APP_PATH" "$DEVICE_ID" "$BUNDLE_ID"
-
-    echo -e "\n${GREEN}Trace files are saved in $OUTPUT_DIR directory${NC}"
-}
-
-main "$@"
