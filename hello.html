@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stream Viewer</title>
+    <style>
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .stream-container {
+            position: relative;
+            width: 100%;
+            background: #f0f0f0;
+            aspect-ratio: 16/9;
+            margin-bottom: 20px;
+        }
+        .stream-image {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+        .controls {
+            margin-top: 10px;
+            display: flex;
+            gap: 10px;
+        }
+        .status {
+            padding: 10px;
+            margin-top: 10px;
+            background: #eee;
+            border-radius: 4px;
+        }
+        button {
+            padding: 8px 16px;
+            cursor: pointer;
+        }
+        .error {
+            color: red;
+            display: none;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Stream Viewer</h1>
+        
+        <!-- Basic Implementation -->
+        <div class="stream-container">
+            <img id="basicStream" class="stream-image" alt="Stream"/>
+        </div>
+
+        <!-- Advanced Implementation -->
+        <div class="stream-container">
+            <canvas id="streamCanvas" class="stream-image"></canvas>
+        </div>
+
+        <div class="controls">
+            <button onclick="startStream()">Start Stream</button>
+            <button onclick="stopStream()">Stop Stream</button>
+        </div>
+
+        <div id="status" class="status">Stream Status: Disconnected</div>
+        <div id="error" class="error">Connection error. Attempting to reconnect...</div>
+    </div>
+
+    <script>
+        let eventSource;
+        let reconnectTimeout;
+        let isConnected = false;
+        const RECONNECT_DELAY = 3000;
+
+        // Basic Implementation
+        function setupBasicStream() {
+            const imgElement = document.getElementById('basicStream');
+            eventSource = new EventSource('/api/stream/video');
+            
+            eventSource.onmessage = function(event) {
+                const blob = new Blob([event.data], { type: 'image/jpeg' });
+                imgElement.src = URL.createObjectURL(blob);
+            };
+        }
+
+        // Advanced Implementation with Canvas
+        function setupAdvancedStream() {
+            const canvas = document.getElementById('streamCanvas');
+            const ctx = canvas.getContext('2d');
+            const img = new Image();
+
+            eventSource = new EventSource('/api/stream/video');
+            
+            eventSource.onmessage = function(event) {
+                const blob = new Blob([event.data], { type: 'image/jpeg' });
+                const url = URL.createObjectURL(blob);
+                
+                img.onload = function() {
+                    // Set canvas size to match image aspect ratio
+                    canvas.width = canvas.offsetWidth;
+                    canvas.height = canvas.offsetHeight;
+                    
+                    // Clear previous frame
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    
+                    // Draw new frame
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    
+                    // Clean up
+                    URL.revokeObjectURL(url);
+                };
+                
+                img.src = url;
+            };
+
+            // Event handlers for connection management
+            eventSource.onopen = function() {
+                isConnected = true;
+                document.getElementById('status').textContent = 'Stream Status: Connected';
+                document.getElementById('error').style.display = 'none';
+                clearTimeout(reconnectTimeout);
+            };
+
+            eventSource.onerror = function() {
+                handleDisconnection();
+            };
+        }
+
+        function handleDisconnection() {
+            if (isConnected) {
+                isConnected = false;
+                document.getElementById('status').textContent = 'Stream Status: Disconnected';
+                document.getElementById('error').style.display = 'block';
+                
+                // Attempt to reconnect
+                reconnectTimeout = setTimeout(() => {
+                    if (!isConnected) {
+                        stopStream();
+                        startStream();
+                    }
+                }, RECONNECT_DELAY);
+            }
+        }
+
+        function startStream() {
+            stopStream(); // Clean up any existing connection
+            setupAdvancedStream(); // Use advanced implementation by default
+        }
+
+        function stopStream() {
+            if (eventSource) {
+                eventSource.close();
+                isConnected = false;
+                document.getElementById('status').textContent = 'Stream Status: Disconnected';
+                document.getElementById('error').style.display = 'none';
+                clearTimeout(reconnectTimeout);
+            }
+        }
+
+        // Start stream when page loads
+        window.addEventListener('load', startStream);
+
+        // Clean up when page is closed
+        window.addEventListener('beforeunload', stopStream);
+    </script>
+</body>
+</html>
