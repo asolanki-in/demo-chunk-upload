@@ -476,3 +476,135 @@
     </script>
 </body>
 </html>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stream Viewer</title>
+    <style>
+        .container {
+            max-width: 1200px;
+            margin: 20px auto;
+            padding: 20px;
+        }
+        .stream-container {
+            background: #f0f0f0;
+            padding: 10px;
+            text-align: center;
+        }
+        .stream-image {
+            max-width: 100%;
+            height: auto;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            background: #eee;
+        }
+        .controls {
+            margin: 10px 0;
+        }
+        button {
+            padding: 8px 16px;
+            margin: 0 5px;
+        }
+        .error {
+            color: red;
+            margin: 10px 0;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Stream Viewer</h2>
+        
+        <div class="controls">
+            <button onclick="startStream()">Start Stream</button>
+            <button onclick="stopStream()">Stop Stream</button>
+        </div>
+
+        <div id="status" class="status">Disconnected</div>
+        <div id="error" class="error"></div>
+
+        <div class="stream-container">
+            <img id="streamImage" class="stream-image" alt="Stream"/>
+        </div>
+    </div>
+
+    <script>
+        let eventSource = null;
+        let frameCount = 0;
+
+        function showError(message) {
+            const errorDiv = document.getElementById('error');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+        }
+
+        function updateStatus(message) {
+            document.getElementById('status').textContent = message;
+        }
+
+        function startStream() {
+            if (eventSource) {
+                stopStream();
+            }
+
+            const img = document.getElementById('streamImage');
+            document.getElementById('error').style.display = 'none';
+            
+            try {
+                eventSource = new EventSource('/api/stream/video');
+
+                eventSource.onopen = function() {
+                    updateStatus('Connected');
+                    console.log('Stream connected');
+                };
+
+                eventSource.onmessage = function(event) {
+                    try {
+                        // Check if data is in correct format
+                        if (!event.data.startsWith('data:image/jpeg;base64,')) {
+                            throw new Error('Invalid image data format');
+                        }
+
+                        // Set the base64 data directly to image src
+                        img.src = event.data;
+                        frameCount++;
+                        updateStatus(`Connected - Frames received: ${frameCount}`);
+
+                    } catch (error) {
+                        console.error('Error processing frame:', error);
+                        showError(`Error processing frame: ${error.message}`);
+                    }
+                };
+
+                eventSource.onerror = function(error) {
+                    console.error('Stream error:', error);
+                    updateStatus('Error - Reconnecting...');
+                };
+
+            } catch (error) {
+                console.error('Failed to create EventSource:', error);
+                showError(`Failed to connect: ${error.message}`);
+                updateStatus('Failed to connect');
+            }
+        }
+
+        function stopStream() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+                updateStatus('Disconnected');
+                frameCount = 0;
+            }
+        }
+
+        // Clean up on page unload
+        window.addEventListener('beforeunload', stopStream);
+    </script>
+</body>
+</html>
