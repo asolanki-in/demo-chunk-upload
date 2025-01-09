@@ -1,0 +1,129 @@
+import { spawn } from "child_process";
+import fs from "fs";
+import path from "path";
+
+interface XCUITestOptions {
+  xctestrunFile: string;
+  deviceUDID: string;
+  resultBundlePath: string;
+  logDir: string;
+}
+
+interface TestStatus {
+  status: "running" | "completed" | "failed";
+  logs: string;
+}
+
+class XCUITestRunner {
+  private processes: Map<string, { process: ReturnType<typeof spawn>; status: TestStatus }> = new Map();
+
+  /**
+   * Run XCUITest asynchronously.
+   */
+  async runTest(options: XCUITestOptions): Promise<string> {
+    const { xctestrunFile, deviceUDID, resultBundlePath, logDir } = options;
+
+    // Ensure log directory exists
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true });
+    }
+
+    const logFile = path.join(logDir, `xcuitest_${Date.now()}.log`);
+    const errorFile = path.join(logDir, `xcuitest_${Date.now()}_error.log`);
+
+    // Construct the XCUITest command
+    const command = "xcodebuild";
+    const args = [
+      "test-without-building",
+      `-xctestrun`, xctestrunFile,
+      `-destination`, `id=${deviceUDID}`,
+      `-resultBundlePath`, resultBundlePath,
+    ];
+
+    // Spawn the process
+    const process = spawn(command, args);
+
+    // Initialize test status
+    const status: TestStatus = {
+      status: "running",
+      logs: logFile,
+    };
+
+    // Save process info in the map
+    const processId = `${deviceUDID}-${Date.now()}`;
+    this.processes.set(processId, { process, status });
+
+    // Log stdout and stderr to files
+    const logStream = fs.createWriteStream(logFile, { flags: "a" });
+    const errorStream = fs.createWriteStream(errorFile, { flags: "a" });
+
+    process.stdout.pipe(logStream);
+    process.stderr.pipe(errorStream);
+
+    // Listen for process completion
+    process.on("close", (code) => {
+      status.status = code === 0 ? "completed" : "failed";
+      logStream.end();
+      errorStream.end();
+    });
+
+    process.on("error", (err) => {
+      status.status = "failed";
+      logStream.end();
+      errorStream.end();
+    });
+
+    return processId; // Return process ID for tracking
+  }
+
+  /**
+   * Check the status of a test run.
+   */
+  getStatus(processId: string): TestStatus | null {
+    const processInfo = this.processes.get(processId);
+    if (!processInfo) {
+      return null; // Process ID not found
+    }
+    return processInfo.status;
+  }
+
+  /**
+   * Terminate a running test (optional).
+   */
+  terminateTest(processId: string): boolean {
+    const processInfo = this.processes.get(processId);
+    if (processInfo) {
+      processInfo.process.kill();
+      this.processes.delete(processId);
+      return true;
+    }
+    return false; // Process not found
+  }
+}
+
+// Usage Example
+(async () => {
+  const testRunner = new XCUITestRunner();
+
+  // Test options
+  const options: XCUITestOptions = {
+    xctestrunFile: "/path/to/file.xctestrun",
+    deviceUDID: "00008030-001C195E1111002E",
+    resultBundlePath: "/path/to/results",
+    logDir: "./logs",
+  };
+
+  // Run the test
+  const processId = await testRunner.runTest(options);
+  console.log(`Test started with Process ID: ${processId}`);
+
+  // Periodically check status
+  const interval = setInterval(() => {
+    const status = testRunner.getStatus(processId);
+    console.log(`Status for Process ID ${processId}:`, status);
+
+    if (status?.status === "completed" || status?.status === "failed") {
+      clearInterval(interval);
+    }
+  }, 5000);
+})();
