@@ -169,3 +169,131 @@
     </script>
 </body>
 </html>
+
+
+
+import { runCommand, findExecutable } from "./utils";
+import fs from "fs-extra";
+import path from "path";
+
+export async function extractEntitlements(appPath: string, outputEntitlementsPath: string): Promise<boolean> {
+    const executablePath = await findExecutable(appPath);
+    try {
+        const entitlements = await runCommand(`codesign -d --entitlements :- ${executablePath}`);
+        if (!entitlements.includes("<plist")) {
+            console.log("⚠️ No entitlements found, skipping entitlements usage.");
+            return false;
+        }
+        await fs.writeFile(outputEntitlementsPath, entitlements);
+        console.log(`✅ Extracted entitlements to ${outputEntitlementsPath}`);
+        return true;
+    } catch (error) {
+        console.log("⚠️ No entitlements found, skipping entitlements usage.");
+        return false;
+    }
+}
+
+export async function createDebugEntitlements(outputEntitlementsPath: string): Promise<void> {
+    const debugEntitlements = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>get-task-allow</key>
+        <true/>
+    </dict>
+</plist>`;
+
+    await fs.writeFile(outputEntitlementsPath, debugEntitlements);
+    console.log(`✅ Created default debug entitlements: ${outputEntitlementsPath}`);
+}
+
+
+import { runCommand } from "./utils";
+import fs from "fs-extra";
+import path from "path";
+
+export async function resignApp(
+    appPath: string,
+    cert: string,
+    entitlementsPath: string | null,
+    provisioningProfilePath: string
+): Promise<void> {
+    const embeddedProfile = path.join(appPath, "embedded.mobileprovision");
+
+    if (fs.existsSync(embeddedProfile)) await fs.unlink(embeddedProfile);
+    await fs.copyFile(provisioningProfilePath, embeddedProfile);
+
+    let codesignCommand = `codesign --force --sign "${cert}" --deep "${appPath}"`;
+    if (entitlementsPath) {
+        codesignCommand += ` --entitlements "${entitlementsPath}"`;
+    }
+
+    await runCommand(codesignCommand);
+    console.log(`✅ Resigned app successfully.`);
+}
+
+
+
+import path from "path";
+import fs from "fs-extra";
+import { extractEntitlements, createDebugEntitlements } from "./entitlements";
+import { resignApp } from "./codesign";
+import { runCommand } from "./utils";
+
+export async function resignIpa(
+    ipaPath: string,
+    cert: string,
+    provisioningProfilePath: string,
+    buildType: "debug" | "developer" | "distribution"
+) {
+    const tempDir = path.join(__dirname, "../temp");
+    const extractedAppPath = path.join(tempDir, "Payload/MyApp.app");
+
+    if (fs.existsSync(tempDir)) await fs.remove(tempDir);
+    await fs.mkdir(tempDir, { recursive: true });
+
+    // Unzip IPA
+    await runCommand(`unzip "${ipaPath}" -d "${tempDir}"`);
+
+    if (!fs.existsSync(extractedAppPath)) throw new Error("Failed to extract .app from IPA");
+
+    // Handle entitlements
+    const entitlementsPath = path.join(tempDir, "entitlements.plist");
+    let hasEntitlements = await extractEntitlements(extractedAppPath, entitlementsPath);
+
+    if (!hasEntitlements && buildType === "debug") {
+        await createDebugEntitlements(entitlementsPath);
+        hasEntitlements = true;
+    }
+
+    await resignApp(
+        extractedAppPath,
+        cert,
+        hasEntitlements ? entitlementsPath : null,
+        provisioningProfilePath
+    );
+
+    // Repackage IPA
+    const resignedIpaPath = path.join(__dirname, `resigned-${buildType}.ipa`);
+    await runCommand(`cd ${tempDir} && zip -r "${resignedIpaPath}" Payload`);
+    await fs.remove(tempDir);
+
+    console.log(`✅ Resigned IPA: ${resignedIpaPath}`);
+}
+
+
+import { resignIpa } from "./resign";
+
+const ipaPath = "MyApp.ipa";
+const cert = "Apple Distribution: YourCompany";
+const provisioningProfilePath = "MyApp.mobileprovision";
+const buildType: "debug" | "developer" | "distribution" = "debug"; // Test debug scenario
+
+(async () => {
+    try {
+        await resignIpa(ipaPath, cert, provisioningProfilePath, buildType);
+    } catch (err) {
+        console.error(`❌ Error: ${(err as Error).message}`);
+    }
+})();
+
