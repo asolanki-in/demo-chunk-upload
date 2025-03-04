@@ -1,265 +1,42 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Stream Viewer</title>
-    <style>
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        .stream-container {
-            position: relative;
-            width: 100%;
-            background: #f0f0f0;
-            aspect-ratio: 16/9;
-            margin-bottom: 20px;
-        }
-        .stream-image {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            object-fit: contain;
-        }
-        .controls {
-            margin-top: 10px;
-            display: flex;
-            gap: 10px;
-        }
-        .status {
-            padding: 10px;
-            margin-top: 10px;
-            background: #eee;
-            border-radius: 4px;
-        }
-        button {
-            padding: 8px 16px;
-            cursor: pointer;
-        }
-        .error {
-            color: red;
-            display: none;
-            margin-top: 10px;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Stream Viewer</h1>
-        
-        <!-- Basic Implementation -->
-        <div class="stream-container">
-            <img id="basicStream" class="stream-image" alt="Stream"/>
-        </div>
-
-        <!-- Advanced Implementation -->
-        <div class="stream-container">
-            <canvas id="streamCanvas" class="stream-image"></canvas>
-        </div>
-
-        <div class="controls">
-            <button onclick="startStream()">Start Stream</button>
-            <button onclick="stopStream()">Stop Stream</button>
-        </div>
-
-        <div id="status" class="status">Stream Status: Disconnected</div>
-        <div id="error" class="error">Connection error. Attempting to reconnect...</div>
-    </div>
-
-    <script>
-        let eventSource;
-        let reconnectTimeout;
-        let isConnected = false;
-        const RECONNECT_DELAY = 3000;
-
-        // Basic Implementation
-        function setupBasicStream() {
-            const imgElement = document.getElementById('basicStream');
-            eventSource = new EventSource('/api/stream/video');
-            
-            eventSource.onmessage = function(event) {
-                const blob = new Blob([event.data], { type: 'image/jpeg' });
-                imgElement.src = URL.createObjectURL(blob);
-            };
-        }
-
-        // Advanced Implementation with Canvas
-        function setupAdvancedStream() {
-            const canvas = document.getElementById('streamCanvas');
-            const ctx = canvas.getContext('2d');
-            const img = new Image();
-
-            eventSource = new EventSource('/api/stream/video');
-            
-            eventSource.onmessage = function(event) {
-                const blob = new Blob([event.data], { type: 'image/jpeg' });
-                const url = URL.createObjectURL(blob);
-                
-                img.onload = function() {
-                    // Set canvas size to match image aspect ratio
-                    canvas.width = canvas.offsetWidth;
-                    canvas.height = canvas.offsetHeight;
-                    
-                    // Clear previous frame
-                    ctx.clearRect(0, 0, canvas.width, canvas.height);
-                    
-                    // Draw new frame
-                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-                    
-                    // Clean up
-                    URL.revokeObjectURL(url);
-                };
-                
-                img.src = url;
-            };
-
-            // Event handlers for connection management
-            eventSource.onopen = function() {
-                isConnected = true;
-                document.getElementById('status').textContent = 'Stream Status: Connected';
-                document.getElementById('error').style.display = 'none';
-                clearTimeout(reconnectTimeout);
-            };
-
-            eventSource.onerror = function() {
-                handleDisconnection();
-            };
-        }
-
-        function handleDisconnection() {
-            if (isConnected) {
-                isConnected = false;
-                document.getElementById('status').textContent = 'Stream Status: Disconnected';
-                document.getElementById('error').style.display = 'block';
-                
-                // Attempt to reconnect
-                reconnectTimeout = setTimeout(() => {
-                    if (!isConnected) {
-                        stopStream();
-                        startStream();
-                    }
-                }, RECONNECT_DELAY);
-            }
-        }
-
-        function startStream() {
-            stopStream(); // Clean up any existing connection
-            setupAdvancedStream(); // Use advanced implementation by default
-        }
-
-        function stopStream() {
-            if (eventSource) {
-                eventSource.close();
-                isConnected = false;
-                document.getElementById('status').textContent = 'Stream Status: Disconnected';
-                document.getElementById('error').style.display = 'none';
-                clearTimeout(reconnectTimeout);
-            }
-        }
-
-        // Start stream when page loads
-        window.addEventListener('load', startStream);
-
-        // Clean up when page is closed
-        window.addEventListener('beforeunload', stopStream);
-    </script>
-</body>
-</html>
-
-
-
-import { runCommand, findExecutable } from "./utils";
-import fs from "fs-extra";
-import path from "path";
-
-export async function extractEntitlements(appPath: string, outputEntitlementsPath: string): Promise<boolean> {
-    const executablePath = await findExecutable(appPath);
-    try {
-        const entitlements = await runCommand(`codesign -d --entitlements :- ${executablePath}`);
-        if (!entitlements.includes("<plist")) {
-            console.log("⚠️ No entitlements found, skipping entitlements usage.");
-            return false;
-        }
-        await fs.writeFile(outputEntitlementsPath, entitlements);
-        console.log(`✅ Extracted entitlements to ${outputEntitlementsPath}`);
-        return true;
-    } catch (error) {
-        console.log("⚠️ No entitlements found, skipping entitlements usage.");
-        return false;
-    }
-}
-
-export async function createDebugEntitlements(outputEntitlementsPath: string): Promise<void> {
-    const debugEntitlements = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-    <dict>
-        <key>get-task-allow</key>
-        <true/>
-    </dict>
-</plist>`;
-
-    await fs.writeFile(outputEntitlementsPath, debugEntitlements);
-    console.log(`✅ Created default debug entitlements: ${outputEntitlementsPath}`);
-}
-
-
-import { runCommand } from "./utils";
-import fs from "fs-extra";
-import path from "path";
-
-export async function resignApp(
-    appPath: string,
-    cert: string,
-    entitlementsPath: string | null,
-    provisioningProfilePath: string
-): Promise<void> {
-    const embeddedProfile = path.join(appPath, "embedded.mobileprovision");
-
-    if (fs.existsSync(embeddedProfile)) await fs.unlink(embeddedProfile);
-    await fs.copyFile(provisioningProfilePath, embeddedProfile);
-
-    let codesignCommand = `codesign --force --sign "${cert}" --deep "${appPath}"`;
-    if (entitlementsPath) {
-        codesignCommand += ` --entitlements "${entitlementsPath}"`;
-    }
-
-    await runCommand(codesignCommand);
-    console.log(`✅ Resigned app successfully.`);
-}
-
-
-
 import path from "path";
 import fs from "fs-extra";
 import { extractEntitlements, createDebugEntitlements } from "./entitlements";
 import { resignApp } from "./codesign";
 import { runCommand } from "./utils";
 
-export async function resignIpa(
-    ipaPath: string,
+export async function resignAppOrIpa(
+    inputPath: string, // Can be .ipa or .app
     cert: string,
     provisioningProfilePath: string,
     buildType: "debug" | "developer" | "distribution"
 ) {
+    let appPath: string;
+    const isIpa = inputPath.endsWith(".ipa");
     const tempDir = path.join(__dirname, "../temp");
-    const extractedAppPath = path.join(tempDir, "Payload/MyApp.app");
 
-    if (fs.existsSync(tempDir)) await fs.remove(tempDir);
-    await fs.mkdir(tempDir, { recursive: true });
+    if (isIpa) {
+        console.log("📦 Detected an IPA file, extracting...");
+        if (fs.existsSync(tempDir)) await fs.remove(tempDir);
+        await fs.mkdir(tempDir, { recursive: true });
 
-    // Unzip IPA
-    await runCommand(`unzip "${ipaPath}" -d "${tempDir}"`);
+        // Unzip IPA
+        await runCommand(`unzip "${inputPath}" -d "${tempDir}"`);
 
-    if (!fs.existsSync(extractedAppPath)) throw new Error("Failed to extract .app from IPA");
+        // Find .app inside the extracted `Payload/`
+        const payloadPath = path.join(tempDir, "Payload");
+        const apps = await fs.readdir(payloadPath);
+        const appFolder = apps.find((file) => file.endsWith(".app"));
+        if (!appFolder) throw new Error("❌ No .app found inside IPA");
+
+        appPath = path.join(payloadPath, appFolder);
+    } else {
+        console.log("📂 Detected an .app bundle, using directly...");
+        appPath = inputPath;
+    }
 
     // Handle entitlements
     const entitlementsPath = path.join(tempDir, "entitlements.plist");
-    let hasEntitlements = await extractEntitlements(extractedAppPath, entitlementsPath);
+    let hasEntitlements = await extractEntitlements(appPath, entitlementsPath);
 
     if (!hasEntitlements && buildType === "debug") {
         await createDebugEntitlements(entitlementsPath);
@@ -267,33 +44,19 @@ export async function resignIpa(
     }
 
     await resignApp(
-        extractedAppPath,
+        appPath,
         cert,
         hasEntitlements ? entitlementsPath : null,
         provisioningProfilePath
     );
 
-    // Repackage IPA
-    const resignedIpaPath = path.join(__dirname, `resigned-${buildType}.ipa`);
-    await runCommand(`cd ${tempDir} && zip -r "${resignedIpaPath}" Payload`);
-    await fs.remove(tempDir);
-
-    console.log(`✅ Resigned IPA: ${resignedIpaPath}`);
-}
-
-
-import { resignIpa } from "./resign";
-
-const ipaPath = "MyApp.ipa";
-const cert = "Apple Distribution: YourCompany";
-const provisioningProfilePath = "MyApp.mobileprovision";
-const buildType: "debug" | "developer" | "distribution" = "debug"; // Test debug scenario
-
-(async () => {
-    try {
-        await resignIpa(ipaPath, cert, provisioningProfilePath, buildType);
-    } catch (err) {
-        console.error(`❌ Error: ${(err as Error).message}`);
+    if (isIpa) {
+        // Repackage IPA
+        const resignedIpaPath = path.join(__dirname, `resigned-${buildType}.ipa`);
+        await runCommand(`cd ${tempDir} && zip -r "${resignedIpaPath}" Payload`);
+        await fs.remove(tempDir);
+        console.log(`✅ Resigned IPA: ${resignedIpaPath}`);
+    } else {
+        console.log(`✅ Resigned .app successfully: ${appPath}`);
     }
-})();
-
+}
