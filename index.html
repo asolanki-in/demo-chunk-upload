@@ -608,3 +608,75 @@
     </script>
 </body>
 </html>
+
+
+
+import path from "path";
+import fs from "fs-extra";
+import { extractEntitlements } from "./entitlements";
+import { resignApp } from "./codesign";
+import { runCommand } from "./utils";
+
+export async function resignIpa(ipaPath: string, cert: string, provisioningProfilePath: string, buildType: "debug" | "developer" | "distribution") {
+    const tempDir = path.join(__dirname, "../temp");
+    const extractedAppPath = path.join(tempDir, "Payload/MyApp.app");
+
+    if (fs.existsSync(tempDir)) await fs.remove(tempDir);
+    await fs.mkdir(tempDir, { recursive: true });
+
+    // Unzip IPA
+    await runCommand(`unzip "${ipaPath}" -d "${tempDir}"`);
+
+    if (!fs.existsSync(extractedAppPath)) throw new Error("Failed to extract .app from IPA");
+
+    // Extract and resign
+    const entitlementsPath = path.join(tempDir, "entitlements.plist");
+    await extractEntitlements(extractedAppPath, entitlementsPath);
+    await resignApp(extractedAppPath, cert, entitlementsPath, provisioningProfilePath);
+
+    // Repackage IPA
+    const resignedIpaPath = path.join(__dirname, `resigned-${buildType}.ipa`);
+    await runCommand(`cd ${tempDir} && zip -r "${resignedIpaPath}" Payload`);
+    await fs.remove(tempDir);
+
+    console.log(`✅ Resigned IPA: ${resignedIpaPath}`);
+}
+
+
+import { resignIpa } from "./resign";
+
+const ipaPath = "MyApp.ipa";
+const cert = "Apple Distribution: YourCompany";
+const provisioningProfilePath = "MyApp.mobileprovision";
+const buildType: "debug" | "developer" | "distribution" = "distribution";
+
+(async () => {
+    try {
+        await resignIpa(ipaPath, cert, provisioningProfilePath, buildType);
+    } catch (err) {
+        console.error(`❌ Error: ${(err as Error).message}`);
+    }
+})();
+
+
+
+
+#!/usr/bin/env node
+import { resignIpa } from "../src/resign";
+
+(async () => {
+    const args = process.argv.slice(2);
+    if (args.length < 3) {
+        console.error("Usage: resign <ipa-path> <cert> <profile>");
+        process.exit(1);
+    }
+
+    const [ipaPath, cert, provisioningProfilePath] = args;
+
+    try {
+        await resignIpa(ipaPath, cert, provisioningProfilePath, "distribution");
+    } catch (err) {
+        console.error(`❌ Error: ${(err as Error).message}`);
+    }
+})();
+
