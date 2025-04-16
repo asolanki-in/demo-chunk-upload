@@ -251,4 +251,45 @@ Promise.all([
 });
 ```
 
-This implementation provides a production-ready solution that handles all the edge cases you'd expect from a system with 25 years of Google-scale experience.
+This implementation provides a production-ready solution that handles all the edge cases you'd expect from a system with 25 years of Google-scale experience
+
+We are seeking a highly skilled and motivated Mobile Test Lab & Automation Infrastructure Engineer to lead the development, maintenance, and scaling of our mobile test lab infrastructure. This role demands hands-on expertise in mobile automation, backend service development, and deep technical knowledge of mobile platforms, especially macOS, which is mandatory for this role. You will work closely with QA, DevOps, and Engineering teams to ensure a stable, scalable, and reliable environment for continuous testing.
+
+⸻
+
+Key Responsibilities:
+	•	Design, manage, and scale a mobile test lab with real devices running on macOS (required).
+	•	Implement and maintain Appium, Selenium Grid, and automation tools for high-performance mobile test execution.
+	•	Develop and maintain backend services and APIs using NodeJS and Spring Boot.
+	•	Work directly with iOS SDK, Xcode Command Line Tools, and Android SDK/CLI tools for device configuration and automation setup.
+	•	Build and support native automation frameworks for iOS (XCUITest) and Android (UIAutomator/Espresso).
+	•	Ensure seamless device registration, management, and execution in lab environments.
+	•	Build robust, RESTful APIs to support lab operations and integrations with test frameworks.
+	•	Own the infrastructure’s scalability, reliability, and performance monitoring.
+	•	Develop and manage automation scripts, modules, and services using NodeJS.
+	•	Optimize test execution environments for concurrency and efficient resource usage.
+	•	Collaborate across teams to support automation pipelines and test coverage.
+
+⸻
+
+Required Skills & Experience:
+	•	macOS expertise is mandatory – deep understanding of managing and automating tasks on macOS systems.
+	•	Strong hands-on experience with Appium, Selenium Grid, and mobile test automation infrastructure.
+	•	Proficiency with iOS SDK, Xcode CLI tools, and managing iOS devices for automation.
+	•	Solid working knowledge of Android SDK, ADB, and CLI-based Android device management.
+	•	Experience with native mobile automation frameworks (XCUITest, UIAutomator, Espresso).
+	•	Strong backend development skills with NodeJS and Java (Spring Boot).
+	•	Solid understanding of REST API development, microservices, and integrations.
+	•	Experience building scalable systems with high availability and performance optimization.
+	•	Excellent debugging and problem-solving skills across platforms and tools.
+
+⸻
+
+Preferred Qualifications:
+	•	Experience with Docker, Kubernetes, or virtualization technologies.
+	•	Familiarity with CI/CD tools (e.g., Jenkins, GitLab CI, CircleCI).
+	•	Exposure to cloud-based device farms (e.g., BrowserStack, Sauce Labs).
+	•	Networking and system architecture knowledge.
+	•	Prior experience in an automation infrastructure or SDET role is a plus.
+
+.
