@@ -159,3 +159,190 @@ main() {
 }
 
 main "$@"
+
+
+
+
+
+import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
+import { EventEmitter } from 'events';
+import { mkdirSync, createWriteStream, WriteStream } from 'fs';
+import { join } from 'path';
+
+export interface LogStreamerOptions {
+  /** How many lines to keep in the in-memory buffer per device */
+  bufferSize?: number;
+  /** Directory to write per-device log files into */
+  logDirectory?: string;
+}
+
+interface Session {
+  process: ChildProcessWithoutNullStreams;
+  buffer: RingBuffer<string>;
+  remainder: string;
+  fileStream: WriteStream;
+  stopped: boolean;
+}
+
+/** Fixed-size ring buffer to avoid O(n) shifts */
+class RingBuffer<T> {
+  private buf: (T | undefined)[];
+  private capacity: number;
+  private head = 0;
+  private size = 0;
+
+  constructor(capacity: number) {
+    this.capacity = capacity;
+    this.buf = new Array(capacity);
+  }
+
+  push(item: T) {
+    this.buf[this.head] = item;
+    this.head = (this.head + 1) % this.capacity;
+    if (this.size < this.capacity) this.size++;
+  }
+
+  /** In-chronological order */
+  getAll(): T[] {
+    const out: T[] = [];
+    const start = this.size === this.capacity ? this.head : 0;
+    for (let i = 0; i < this.size; i++) {
+      const idx = (start + i) % this.capacity;
+      const v = this.buf[idx];
+      if (v !== undefined) out.push(v);
+    }
+    return out;
+  }
+}
+
+export class IOSLogStreamer extends EventEmitter {
+  private sessions = new Map<string, Session>();
+  private bufferSize: number;
+  private logDirectory: string;
+
+  constructor(opts: LogStreamerOptions = {}) {
+    super();
+    this.bufferSize = opts.bufferSize ?? 1000;
+    this.logDirectory = opts.logDirectory ?? './logs';
+
+    // recursive: true is idempotent if dir already exists
+    mkdirSync(this.logDirectory, { recursive: true });
+  }
+
+  /**
+   * Start streaming logs for the given device UDID.
+   * @throws if already streaming for this UDID
+   */
+  public startLogs(udid: string): void {
+    if (this.sessions.has(udid)) {
+      throw new Error(`Logs already streaming for device ${udid}`);
+    }
+
+    const proc = spawn('idevicesyslog', ['-u', udid], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    const buffer = new RingBuffer<string>(this.bufferSize);
+    const filePath = join(this.logDirectory, `${udid}.log`);
+    const fileStream = createWriteStream(filePath, { flags: 'a' });
+
+    const session: Session = {
+      process: proc,
+      buffer,
+      remainder: '',
+      fileStream,
+      stopped: false
+    };
+    this.sessions.set(udid, session);
+
+    // Handle spawn errors (e.g. binary not found)
+    proc.on('error', err => {
+      this.emit('error', udid, err);
+      this.cleanupSession(udid);
+    });
+
+    // File-write errors
+    fileStream.on('error', err => {
+      this.emit('error', udid, err);
+      // we keep going—UI might recover, but you could also cleanup here
+    });
+
+    // Stdout data with chunk-boundary handling
+    proc.stdout.on('data', (chunk: Buffer) => {
+      const text = session.remainder + chunk.toString('utf8');
+      const parts = text.split(/\r?\n/);
+      session.remainder = parts.pop() ?? '';
+
+      for (const line of parts) {
+        if (!line.trim()) continue;
+
+        buffer.push(line);
+        fileStream.write(line + '\n');
+        this.emit('log', udid, line);
+      }
+    });
+
+    // Stderr → treated as errors
+    proc.stderr.on('data', (errBuf: Buffer) => {
+      const msg = errBuf.toString('utf8').trim();
+      if (msg) {
+        this.emit('error', udid, new Error(msg));
+      }
+    });
+
+    // Clean shutdown
+    proc.on('close', (code, signal) => {
+      if (!session.stopped) {
+        // if we didn't explicitly stop, still treat as stopped
+        this.emit('stopped', udid, { code, signal });
+      }
+      this.cleanupSession(udid);
+    });
+
+    this.emit('started', udid);
+  }
+
+  /**
+   * Stop streaming logs for the given UDID.
+   * @throws if there is no active session for this UDID
+   */
+  public stopLogs(udid: string): void {
+    const session = this.sessions.get(udid);
+    if (!session) {
+      throw new Error(`No active logging session for device ${udid}`);
+    }
+    if (session.process.killed) return;
+
+    session.stopped = true;
+    try {
+      session.process.kill('SIGINT');
+    } catch (err: any) {
+      // ignore if process already gone
+      if (err.code !== 'ESRCH') {
+        this.emit('error', udid, err);
+      }
+    }
+  }
+
+  /**
+   * Retrieve the current in-memory buffer of recent log lines.
+   */
+  public getBufferedLogs(udid: string): string[] {
+    const session = this.sessions.get(udid);
+    if (!session) {
+      throw new Error(`No active logging session for device ${udid}`);
+    }
+    return session.buffer.getAll();
+  }
+
+  /** Internal cleanup of session resources */
+  private cleanupSession(udid: string) {
+    const s = this.sessions.get(udid);
+    if (!s) return;
+    s.fileStream.end();
+    this.sessions.delete(udid);
+  }
+}
+
+// Export a singleton instance
+export default new IOSLogStreamer();
