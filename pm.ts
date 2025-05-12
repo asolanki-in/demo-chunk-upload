@@ -244,4 +244,106 @@ $(function() {
   });
 });
 
+// public/logWorker.js
+
+// Maximum lines we’ll keep in worker memory (optional)
+const MAX_BUFFER = 2000;  
+
+// This buffer is private to the worker
+let buffer = [];
+
+self.onmessage = function(e) {
+  const { type, data } = e.data;
+
+  if (type === 'log.batch') {
+    // Append new lines
+    buffer.push(...data);
+    // Trim if too large
+    if (buffer.length > MAX_BUFFER) {
+      buffer.splice(0, buffer.length - MAX_BUFFER);
+    }
+    // Send back just the new batch (so main thread can append)
+    self.postMessage({ type: 'render', data });
+  }
+};
+
+$(function() {
+  let socket;
+  let autoScroll = true;
+  let lineNo = 0;
+
+  const $container = $('#logContainer');
+  const $body      = $('#logTableBody');
+
+  // 1) Spin up the worker
+  const worker = new Worker('logWorker.js');
+  worker.onmessage = function(e) {
+    const { type, data } = e.data;
+    if (type === 'render') {
+      // data is an array of new lines
+      data.forEach(appendLine);
+    }
+  };
+
+  // Pause auto-scroll when user scrolls up
+  $container.on('scroll', () => {
+    autoScroll = $container[0].scrollHeight - $container[0].scrollTop
+               <= $container[0].clientHeight + 5;
+  });
+
+  // Append a single log line
+  function appendLine(line) {
+    lineNo++;
+    const $tr = $('<tr>')
+      .append($('<td>').text(lineNo))
+      .append($('<td>').text(line));
+    $body.append($tr);
+
+    // Keep DOM rows under 1000
+    if ($body.children().length > 1000) {
+      $body.children().first().remove();
+    }
+
+    if (autoScroll) {
+      $container.scrollTop($container[0].scrollHeight);
+    }
+  }
+
+  // Connect button
+  $('#connectBtn').click(() => {
+    const udid = $('#deviceInput').val().toString().trim();
+    if (!udid) return alert('Please enter a UDID.');
+    lineNo = 0;
+    $body.empty();
+
+    // connect socket.io
+    socket = io({ query: { udid } });
+
+    socket.on('connect_error', err => {
+      alert('Connection error: ' + err.message);
+    });
+
+    // Instead of directly appending, POST batches into the worker
+    socket.on('log.batch', batch => {
+      worker.postMessage({ type: 'log.batch', data: batch });
+    });
+
+    socket.on('log.error', msg => {
+      alert('Error: ' + msg);
+    });
+
+    socket.on('log.stop', () => {
+      alert('Log stream stopped by server.');
+    });
+  });
+
+  // Clear button
+  $('#clearBtn').click(() => {
+    $body.empty();
+    lineNo = 0;
+    if (socket && socket.connected) {
+      socket.emit('clear');
+    }
+  });
+});
 
