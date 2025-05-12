@@ -2,119 +2,111 @@ import express from 'express';
 import http from 'http';
 import path from 'path';
 import { WebSocketServer, WebSocket } from 'ws';
-import adb from '@devicefarmer/adbkit';
-import { LogcatEntry } from '@devicefarmer/adbkit-logcat';
+import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
+import readline from 'readline';
 
 // ---- Configuration ----
 const PORT = 3000;
-const LOG_BUFFER_SIZE = 1000;
-const BATCH_INTERVAL_MS = 100;
-const MAX_WS_BUFFERED_AMOUNT = 5e6; // 5 MB
+const LOG_BUFFER_SIZE = 1000;      // max lines in memory per device
+const BATCH_INTERVAL_MS = 100;     // ms between batches
+const MAX_WS_BUFFERED = 5e6;       // 5 MB per socket
 
 // ---- Types ----
 interface DeviceState {
-  reader: any;
-  buffer: LogcatEntry[];
+  process: ChildProcessWithoutNullStreams;
+  buffer: string[];
+  pending: string[];
   sockets: Set<WebSocket>;
-  pending: LogcatEntry[];
   batchTimer: NodeJS.Timeout;
 }
+
 const devices = new Map<string, DeviceState>();
 
-// ---- ADB Client ----
-const adbClient = adb.createClient();
-
-// ---- Start logcat + batching for a device ----
-async function startStreaming(serial: string) {
-  if (devices.has(serial)) return;
+// ---- Start syslog streaming for given UDID ----
+async function startIosStreaming(udid: string) {
+  if (devices.has(udid)) return;
+  // spawn idevicesyslog; requires libimobiledevice installed
+  const proc = spawn('idevicesyslog', ['-u', udid]);
+  const rl = readline.createInterface({ input: proc.stdout });
 
   const state: DeviceState = {
-    reader: null as any,
+    process: proc,
     buffer: [],
-    sockets: new Set(),
     pending: [],
+    sockets: new Set(),
     batchTimer: null as any
   };
-  devices.set(serial, state);
+  devices.set(udid, state);
 
-  try {
-    const reader = await adbClient.openLogcat(serial, { clear: true });
-    state.reader = reader;
+  // On each log line
+  rl.on('line', line => {
+    state.buffer.push(line);
+    if (state.buffer.length > LOG_BUFFER_SIZE) state.buffer.shift();
+    state.pending.push(line);
+  });
 
-    reader.on('entry', (entry: LogcatEntry) => {
-      (entry as any).serial = serial;
-      // Buffer for new clients
-      state.buffer.push(entry);
-      if (state.buffer.length > LOG_BUFFER_SIZE) {
-        state.buffer.shift();
+  // Handle process exit
+  proc.on('error', err => {
+    for (const ws of state.sockets) {
+      ws.send(JSON.stringify({ event: 'log.error', data: err.message }));
+    }
+    teardown();
+  });
+  proc.on('close', (code, signal) => {
+    for (const ws of state.sockets) {
+      ws.send(JSON.stringify({ event: 'log.stop', data: { udid, code, signal } }));
+    }
+    teardown();
+  });
+
+  // Batch timer
+  state.batchTimer = setInterval(() => {
+    if (!state.pending.length) return;
+    const batch = state.pending.splice(0);
+    const msg = JSON.stringify({ event: 'log.batch', data: batch });
+    for (const ws of state.sockets) {
+      if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < MAX_WS_BUFFERED) {
+        ws.send(msg, err => { if (err) console.error('WS send error:', err); });
       }
-      // Queue for batch send
-      state.pending.push(entry);
-    });
+    }
+  }, BATCH_INTERVAL_MS);
 
-    const teardown = (event: string, err?: Error) => {
-      clearInterval(state.batchTimer);
-      for (const ws of state.sockets) {
-        const payload = err
-          ? { event: 'logcat.error', data: { serial, error: err.message } }
-          : { event: 'logcat.stop', data: { serial, reason: event } };
-        try { ws.send(JSON.stringify(payload)); } catch {}
-      }
-      devices.delete(serial);
-    };
-
-    reader.on('end', () => teardown('ended'));
-    reader.on('error', (err: Error) => teardown('error', err));
-
-    // Batch timer
-    state.batchTimer = setInterval(() => {
-      if (state.pending.length === 0) return;
-      const batch = state.pending.splice(0);
-      const msg = JSON.stringify({ event: 'logcat.batch', data: batch });
-      for (const ws of state.sockets) {
-        if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < MAX_WS_BUFFERED_AMOUNT) {
-          ws.send(msg, err => { if (err) console.error('WS send error:', err); });
-        }
-      }
-    }, BATCH_INTERVAL_MS);
-
-    console.log(`Started logcat streaming for device ${serial}`);
-  } catch (err: any) {
-    devices.delete(serial);
-    throw err;
+  function teardown() {
+    clearInterval(state.batchTimer);
+    rl.close();
+    devices.delete(udid);
   }
 }
 
-// ---- Express + Static Files ----
+// ---- HTTP & WebSocket setup ----
 const app = express();
 app.use(express.static(path.join(__dirname, '../public')));
-
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// ---- WebSocket Handling ----
 wss.on('connection', async (ws, req) => {
-  // Parse serial from URL ?serial=<serial>
-  const params = new URLSearchParams((req.url || '').slice(2));
-  const serial = params.get('serial');
-  if (!serial) {
-    ws.send(JSON.stringify({ event: 'error', data: 'Missing serial parameter' }));
+  // Parse UDID from query: ws://host?udid=<udid>
+  const url = new URL(req.url!, 'http://localhost');
+  const udid = url.searchParams.get('udid');
+  if (!udid) {
+    ws.send(JSON.stringify({ event: 'error', data: 'Missing udid parameter' }));
     return ws.close();
   }
 
+  // Start streaming if needed
   try {
-    await startStreaming(serial);
-  } catch (err: any) {
-    ws.send(JSON.stringify({ event: 'logcat.error', data: { serial, error: err.message } }));
+    await startIosStreaming(udid);
+  } catch (e: any) {
+    ws.send(JSON.stringify({ event: 'log.error', data: e.message }));
     return ws.close();
   }
 
-  const state = devices.get(serial)!;
+  const state = devices.get(udid)!;
   state.sockets.add(ws);
 
-  // Send buffered log history
+  // Send existing buffer as init batch
   if (state.buffer.length) {
-    ws.send(JSON.stringify({ event: 'logcat.batch', data: state.buffer }));
+    ws.send(JSON.stringify({ event: 'log.batch', data: state.buffer }));
   }
 
   ws.on('message', msg => {
@@ -122,54 +114,46 @@ wss.on('connection', async (ws, req) => {
       const m = JSON.parse(msg.toString());
       if (m.event === 'clear') {
         state.buffer = [];
-        ws.send(JSON.stringify({ event: 'logcat.cleared', data: { serial } }));
+        ws.send(JSON.stringify({ event: 'log.cleared', data: { udid } }));
       }
     } catch {}
   });
 
   ws.on('close', () => {
     state.sockets.delete(ws);
-    if (state.sockets.size === 0) {
+    if (!state.sockets.size) {
+      // no clients → kill process & cleanup
+      state.process.kill();
       clearInterval(state.batchTimer);
-      try { state.reader.end(); } catch {}
-      devices.delete(serial);
-      console.log(`Stopped streaming for ${serial} (no more clients)`);
+      devices.delete(udid);
     }
   });
 
-  ws.on('error', err => {
-    console.error(`WebSocket error for ${serial}:`, err);
-  });
+  ws.on('error', err => console.error(`WS error for ${udid}:`, err));
 });
 
-// ---- Global Error Handling ----
-process.on('uncaughtException', err => console.error('Uncaught Exception:', err));
-process.on('unhandledRejection', err => console.error('Unhandled Rejection:', err));
-
-// ---- Start Server ----
 server.listen(PORT, () => {
-  console.log(`Server listening at http://localhost:${PORT}`);
+  console.log(`iOS Log Streamer running at http://localhost:${PORT}`);
 });
-
 
 
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>Android Log Viewer</title>
+  <title>iOS Log Viewer</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div id="controls">
-    Device: <input id="deviceInput" placeholder="Enter device serial">
+    UDID: <input id="deviceInput" placeholder="Enter iOS UDID">
     <button id="connectBtn">Connect</button>
     <button id="clearBtn">Clear</button>
   </div>
   <div id="logContainer">
     <table>
       <thead>
-        <tr><th>Time</th><th>Lvl</th><th>Tag</th><th>PID</th><th>Msg</th></tr>
+        <tr><th>#</th><th>Log Line</th></tr>
       </thead>
       <tbody id="logTableBody"></tbody>
     </table>
@@ -180,38 +164,51 @@ server.listen(PORT, () => {
 </body>
 </html>
 
+body {
+  margin: 0;
+  font: 14px/1.4 sans-serif;
+}
+#controls {
+  padding: 8px;
+  background: #eee;
+}
+#logContainer {
+  height: 400px;
+  overflow-y: scroll;
+  background: #000;
+  color: #fff;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th, td {
+  padding: 2px 4px;
+  white-space: pre;
+  font-family: monospace;
+}
+tr:nth-child(odd) td { opacity: 0.8; }
 
 
 
 $(function() {
   let socket;
   let autoScroll = true;
-
   const $container = $('#logContainer');
   const $body = $('#logTableBody');
+  let lineNo = 0;
 
-  // Auto-scroll toggle
-  $container.on('scroll', function() {
-    const nearBottom = this.scrollHeight - this.scrollTop <= this.clientHeight + 5;
-    autoScroll = nearBottom;
+  // Pause auto-scroll when user scrolls up
+  $container.on('scroll', () => {
+    autoScroll = $container[0].scrollHeight - $container[0].scrollTop <= $container[0].clientHeight + 5;
   });
 
-  // Append one log entry
-  function append(entry) {
-    const date = new Date(entry.date * 1000);
-    const time = date.toTimeString().split(' ')[0] + '.' +
-                 date.getMilliseconds().toString().padStart(3, '0');
-    const prioMap = {2:'V',3:'D',4:'I',5:'W',6:'E',7:'F'};
-    const lvl = prioMap[entry.priority] || entry.priority;
+  function appendLine(line) {
+    lineNo++;
     const $tr = $('<tr>')
-      .addClass('level-' + lvl)
-      .append($('<td>').text(time))
-      .append($('<td>').text(lvl))
-      .append($('<td>').text(entry.tag || ''))
-      .append($('<td>').text(entry.pid || ''))
-      .append($('<td>').text(entry.message || ''));
+      .append($('<td>').text(lineNo))
+      .append($('<td>').text(line));
     $body.append($tr);
-    // Trim old rows
     if ($body.children().length > 1000) {
       $body.children().first().remove();
     }
@@ -220,30 +217,31 @@ $(function() {
     }
   }
 
-  // Connect button
-  $('#connectBtn').click(function() {
-    const serial = $('#deviceInput').val().toString().trim();
-    if (!serial) return alert('Please enter a device serial.');
-    socket = new WebSocket(`ws://${location.host}?serial=${encodeURIComponent(serial)}`);
+  $('#connectBtn').click(() => {
+    const udid = $('#deviceInput').val().toString().trim();
+    if (!udid) return alert('Please enter a UDID.');
+    lineNo = 0;
+    $body.empty();
+    socket = new WebSocket(`ws://${location.host}?udid=${encodeURIComponent(udid)}`);
 
-    socket.onmessage = function(evt) {
+    socket.onmessage = (evt) => {
       const msg = JSON.parse(evt.data);
-      if (msg.event === 'logcat.batch') {
-        msg.data.forEach(append);
-      } else if (msg.event === 'logcat.error' || msg.event === 'logcat.stop') {
-        alert(msg.data.error || 'Log stream stopped.');
+      if (msg.event === 'log.batch') {
+        msg.data.forEach(appendLine);
+      } else if (msg.event === 'log.error' || msg.event === 'log.stop') {
+        alert(msg.data.error || 'Log streaming stopped.');
       }
     };
-    socket.onerror = () => alert('WebSocket error. Check console.');
-    socket.onclose = () => console.warn('WebSocket closed.');
+    socket.onerror = () => alert('WebSocket error; check console.');
   });
 
-  // Clear button
-  $('#clearBtn').click(function() {
+  $('#clearBtn').click(() => {
     $body.empty();
+    lineNo = 0;
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ event: 'clear' }));
     }
   });
 });
+
 
