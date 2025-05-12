@@ -7,12 +7,13 @@ $(function() {
   const containerEl = $container[0];
   const tbody = document.getElementById('logTableBody');
 
-  // 1) Render queue & state
+  // Render queue & state
   const renderQueue = [];
   let rendering = false;
-  const LINES_PER_FRAME = 20;  // tweak this up or down
+  const LINES_PER_FRAME   = 20;   // how many lines to render per RAF
+  const MAX_VISIBLE_LINES = 100;  // cap visible rows at 100
 
-  // 2) Schedule a new RAF render if not already running
+  // Schedule a render if needed
   function scheduleRender() {
     if (!rendering) {
       rendering = true;
@@ -20,40 +21,39 @@ $(function() {
     }
   }
 
-  // 3) The actual render loop: draw up to LINES_PER_FRAME each frame
+  // Render up to LINES_PER_FRAME each animation frame
   function renderFrame() {
     const fragment = document.createDocumentFragment();
     let count = 0;
+
     while (count < LINES_PER_FRAME && renderQueue.length) {
       const line = renderQueue.shift();
       lineNo++;
 
-      // build <tr><td>#</td><td>line</td></tr>
-      const tr = document.createElement('tr');
+      const tr    = document.createElement('tr');
       const tdNum = document.createElement('td');
-      tdNum.textContent = String(lineNo);
+      tdNum.textContent    = String(lineNo);
       const tdLine = document.createElement('td');
-      tdLine.textContent = line;
+      tdLine.textContent   = line;
+
       tr.appendChild(tdNum);
       tr.appendChild(tdLine);
       fragment.appendChild(tr);
-
       count++;
     }
 
     tbody.appendChild(fragment);
 
-    // Trim old rows
-    while (tbody.children.length > 1000) {
+    // **Trim down to only the latest 100 rows**
+    while (tbody.children.length > MAX_VISIBLE_LINES) {
       tbody.removeChild(tbody.firstChild!);
     }
 
-    // Auto-scroll if we're at (or near) bottom
+    // Auto‐scroll if at (or near) bottom
     if (autoScroll) {
       containerEl.scrollTop = containerEl.scrollHeight;
     }
 
-    // Continue if there's still work
     if (renderQueue.length) {
       requestAnimationFrame(renderFrame);
     } else {
@@ -61,18 +61,19 @@ $(function() {
     }
   }
 
-  // 4) Wire up scroll to pause auto-scroll
+  // Pause auto‐scroll when user scrolls up
   $container.on('scroll', () => {
     autoScroll = containerEl.scrollHeight - containerEl.scrollTop
                <= containerEl.clientHeight + 5;
   });
 
-  // 5) Connect button
+  // Connect button
   $('#connectBtn').on('click', () => {
     const udid = $('#deviceInput').val()?.toString().trim();
     if (!udid) return alert('Enter a UDID');
     lineNo = 0;
-    tbody.innerHTML = '';   // clear existing
+    tbody.innerHTML = '';      // clear UI
+    renderQueue.length = 0;    // clear pending
 
     socket = io(socketUrl, { query: { udid } });
 
@@ -80,7 +81,7 @@ $(function() {
       alert('Connection error: ' + err.message);
     });
 
-    // Push entire batch into our renderQueue, then schedule a render
+    // enqueue incoming batches
     socket.on('log.batch', batch => {
       renderQueue.push(...batch);
       scheduleRender();
@@ -95,7 +96,7 @@ $(function() {
     });
   });
 
-  // 6) Clear button
+  // Clear button
   $('#clearBtn').on('click', () => {
     tbody.innerHTML = '';
     lineNo = 0;
