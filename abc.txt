@@ -290,6 +290,105 @@ Preferred Qualifications:
 	•	Familiarity with CI/CD tools (e.g., Jenkins, GitLab CI, CircleCI).
 	•	Exposure to cloud-based device farms (e.g., BrowserStack, Sauce Labs).
 	•	Networking and system architecture knowledge.
-	•	Prior experience in an automation infrastructure or SDET role is a plus.
+	•	Prior experience in an automation infrastructure or SDET role is a #!/usr/bin/env bash
+set -e
 
-.
+# ── CONFIG ─────────────────────────────────────────────────────────────────────
+
+# Change these as needed
+SECRET="kittykat"
+IP="127.0.0.1"
+
+# Port assignments
+WEB_PORT=7100
+API_PORT=7106
+AUTH_PORT=7120
+
+# Triproxy ports
+APP_PUB="tcp://$IP:7111"
+APP_DEALER="tcp://$IP:7112"
+APP_PULL="tcp://$IP:7113"
+DEV_PUB="tcp://$IP:7114"
+DEV_DEALER="tcp://$IP:7115"
+DEV_PULL="tcp://$IP:7116"
+
+# Storage ports
+STG_TEMP_PORT=7102
+STG_IMG_PORT=7103
+STG_APK_PORT=7104
+
+# Provider settings
+MIN_PORT=15000
+MAX_PORT=25000
+HEARTBEAT=10000
+
+# Log directory
+LOG_DIR="./logs"
+mkdir -p "$LOG_DIR"
+
+# ── FUNCTIONS ──────────────────────────────────────────────────────────────────
+
+start() {
+  echo "[$(date +'%T')] Starting: $*"
+  nohup bash -c "$*" > "$LOG_DIR/$(echo $1 | awk '{print $1}').log" 2>&1 &
+  sleep 1
+}
+
+# ── START SERVICES ──────────────────────────────────────────────────────────────
+
+# 1. RethinkDB (if not already running)
+if ! pgrep rethinkdb >/dev/null; then
+  start "rethinkdb"
+fi
+
+# 2. Auth Mock
+start "stf auth-mock --port $AUTH_PORT --secret \"$SECRET\" --app-url http://$IP/"
+
+# 3. Triproxy (app & dev)
+start "stf triproxy app --bind-pub \"$APP_PUB\" --bind-dealer \"$APP_DEALER\" --bind-pull \"$APP_PULL\""
+start "stf triproxy dev --bind-pub \"$DEV_PUB\" --bind-dealer \"$DEV_DEALER\" --bind-pull \"$DEV_PULL\""
+
+# 4. Processor
+start "stf processor proc1 --connect-app-dealer $APP_DEALER --connect-dev-dealer $DEV_DEALER"
+
+# 5. Storage services
+start "stf storage-temp --port $STG_TEMP_PORT"
+start "stf storage-plugin-image --port $STG_IMG_PORT --storage-url http://$IP/"
+start "stf storage-plugin-apk   --port $STG_APK_PORT --storage-url http://$IP/"
+
+# 6. API (needs both app & dev buses)
+start "stf api \
+  --port $API_PORT \
+  --secret \"$SECRET\" \
+  --connect-sub      $APP_PUB \
+  --connect-push     $APP_PULL \
+  --connect-sub-dev  $DEV_PUB \
+  --connect-push-dev $DEV_PULL"
+
+# 7. Web App
+start "stf app \
+  --port $WEB_PORT \
+  --secret \"$SECRET\" \
+  --auth-url http://$IP:$AUTH_PORT/ \
+  --websocket-url http://$IP/"
+
+# 8. Provider (with screen-quality control)
+start "stf provider \
+  --name macProvider1 \
+  --allow-remote \
+  --min-port $MIN_PORT \
+  --max-port $MAX_PORT \
+  --connect-sub $DEV_PUB \
+  --connect-push $DEV_PULL \
+  --public-ip $IP \
+  --screen-ws-url-pattern \"ws://$IP:<%= publicPort %>/\" \
+  --screen-jpeg-quality 80 \
+  --heartbeat-interval $HEARTBEAT \
+  --secret \"$SECRET\" \
+  --storage-url http://$IP/"
+
+echo "[$(date +'%T')] All STF components have been started."
+
+
+
+
