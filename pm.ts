@@ -1,77 +1,219 @@
-#!/bin/bash
+// goIosWrapper.ts
 
-set -e
+import fs from 'fs';
+import { execa } from 'execa';
+import { spawn, ChildProcess } from 'child_process';
 
-# ======== CONFIG ========
-IPA_INPUT="$1"
-CERT_NAME="iPhone Developer: Your Name (XXXXXXXXXX)"
-PROVISION_PROFILE="dev.mobileprovision"
-OUTPUT_IPA="Resigned-$IPA_INPUT"
-TMP_DIR="resign_tmp"
-ENTITLEMENTS_FILE="entitlements.plist"
-# =========================
+/**
+ * Raw JSON shape returned by `ios list --details`.
+ */
+interface RawDeviceInfo {
+  UDID: string;
+  Name?: string;
+  ProductVersion?: string;
+  Model?: string;
+  [key: string]: any;
+}
 
-if [[ -z "$IPA_INPUT" ]]; then
-  echo "Usage: $0 path/to/app.ipa"
-  exit 1
-fi
+/**
+ * Cleaned up device info.
+ */
+export interface DeviceInfo {
+  udid: string;
+  name?: string;
+  version?: string;
+  model?: string;
+}
 
-# Clean
-rm -rf "$TMP_DIR" "$OUTPUT_IPA" "$ENTITLEMENTS_FILE"
-mkdir -p "$TMP_DIR"
+/**
+ * Wrapper around the go-ios CLI for macOS.
+ * Supports:
+ *  - listDevices
+ *  - installApp
+ *  - uninstallApp
+ *  - launchWebDriverAgent / stopWebDriverAgent
+ *  - rebootDevice
+ *  - launchApp (with optional wait & killExisting) / stopTunnel
+ *
+ * Automatically handles iOS 17+ tunnel startup and maps JSON fields correctly.
+ */
+export class GoIosWrapper {
+  private iosBinary: string;
+  private tunnelStarted = false;
+  private tunnelProcess?: ChildProcess;
 
-# Unpack IPA
-echo "[*] Unpacking IPA..."
-unzip -q "$IPA_INPUT" -d "$TMP_DIR"
+  constructor(iosBinary: string = 'ios') {
+    this.iosBinary = iosBinary;
+  }
 
-APP_PATH=$(find "$TMP_DIR/Payload" -name "*.app" | head -n 1)
-APP_BINARY=$(plutil -extract CFBundleExecutable xml1 -o - "$APP_PATH/Info.plist" | grep -A1 "<string>" | tail -n1 | sed -E 's/.*<string>(.*)<\/string>.*/\1/')
+  /**
+   * Start the go-ios tunnel daemon (detached).
+   * Required for iOS 17+ devices. 
+   */
+  private async startTunnel(): Promise<void> {
+    if (this.tunnelStarted) return;
 
-echo "[*] Found app: $APP_PATH"
-echo "[*] Replacing provisioning profile..."
-cp "$PROVISION_PROFILE" "$APP_PATH/embedded.mobileprovision"
+    this.tunnelProcess = spawn(
+      this.iosBinary,
+      ['tunnel', 'start'],
+      { stdio: 'ignore', detached: true }
+    );
+    this.tunnelProcess.unref();
 
-# Extract team ID and bundle ID from provisioning profile
-echo "[*] Extracting team ID..."
-TEAM_ID=$(security cms -D -i "$PROVISION_PROFILE" | plutil -extract TeamIdentifier raw -o - -)
-APP_ID=""
+    // Wait briefly for the tunnel interface to initialize
+    await new Promise(res => setTimeout(res, 2000));
+    this.tunnelStarted = true;
+  }
 
-# Extract entitlements (original)
-echo "[*] Extracting entitlements..."
-codesign -d --entitlements :- "$APP_PATH" > full-entitlements.plist 2>/dev/null || true
+  /**
+   * Compare major version numbers.
+   */
+  private versionAtLeast(version: string, major: number): boolean {
+    const maj = parseInt(version.split('.')[0], 10);
+    return maj >= major;
+  }
 
-# Generate safe entitlements
-cat > "$ENTITLEMENTS_FILE" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>application-identifier</key>
-  <string>$TEAM_ID.*</string>
-  <key>get-task-allow</key>
-  <true/>
-</dict>
-</plist>
-EOF
+  /**
+   * If device is iOS 17+, ensure tunnel is running before proceeding.
+   */
+  private async ensureTunnelForDevice(udid: string): Promise<void> {
+    const devices = await this.listDevices();
+    const device = devices.find(d => d.udid === udid);
+    if (!device) throw new Error(`Unknown device UDID: ${udid}`);
+    if (device.version && this.versionAtLeast(device.version, 17)) {
+      await this.startTunnel();
+    }
+  }
 
-# Resign frameworks (if any)
-echo "[*] Resigning embedded frameworks..."
-find "$APP_PATH/Frameworks" -type f -name "*.dylib" -or -name "*.framework" | while read framework; do
-  codesign -f -s "$CERT_NAME" --preserve-metadata=identifier,flags "$framework"
-done
+  /**
+   * List all connected devices with details.
+   * Uses: `ios list --details` 
+   */
+  public async listDevices(): Promise<DeviceInfo[]> {
+    try {
+      const { stdout } = await execa(this.iosBinary, ['list', '--details']);
+      const raw = JSON.parse(stdout) as RawDeviceInfo[];
+      return raw.map(d => ({
+        udid: d.UDID,
+        name: d.Name,
+        version: d.ProductVersion,
+        model: d.Model
+      }));
+    } catch (err: any) {
+      throw new Error(`Failed to list devices: ${err.stderr || err.message}`);
+    }
+  }
 
-# Resign app
-echo "[*] Resigning app binary..."
-codesign -f -s "$CERT_NAME" --entitlements "$ENTITLEMENTS_FILE" "$APP_PATH"
+  /**
+   * Ensure the file exists, else throw.
+   */
+  private validateFilePath(path: string): void {
+    if (!fs.existsSync(path)) {
+      throw new Error(`File not found: ${path}`);
+    }
+  }
 
-# Validate
-echo "[*] Verifying signature..."
-codesign -v "$APP_PATH" && echo "[+] Resign successful"
+  /**
+   * Install an IPA or .app on the device.
+   * Uses: `ios install --path <path> --udid <udid>` 
+   */
+  public async installApp(udid: string, path: string): Promise<void> {
+    this.validateFilePath(path);
+    await this.ensureTunnelForDevice(udid);
+    try {
+      await execa(this.iosBinary, ['install', '--path', path, `--udid=${udid}`]);
+    } catch (err: any) {
+      throw new Error(`Install failed: ${err.stderr || err.message}`);
+    }
+  }
 
-# Repackage
-echo "[*] Creating resigned IPA..."
-cd "$TMP_DIR"
-zip -qr "../$OUTPUT_IPA" Payload
-cd ..
+  /**
+   * Uninstall an app by bundle identifier.
+   * Uses: `ios uninstall <bundleId> --udid <udid>` 
+   */
+  public async uninstallApp(udid: string, bundleId: string): Promise<void> {
+    await this.ensureTunnelForDevice(udid);
+    try {
+      await execa(this.iosBinary, ['uninstall', bundleId, `--udid=${udid}`]);
+    } catch (err: any) {
+      throw new Error(`Uninstall failed: ${err.stderr || err.message}`);
+    }
+  }
 
-echo "[+] Done. Output: $OUTPUT_IPA"
+  /**
+   * Launch WebDriverAgent on the device.
+   * Returns the detached ChildProcess so you can stop it later.
+   * Uses: `ios runwda --udid <udid>` 
+   */
+  public async launchWebDriverAgent(udid: string, logFile?: string): Promise<ChildProcess> {
+    await this.ensureTunnelForDevice(udid);
+    const args = ['runwda', `--udid=${udid}`];
+    if (logFile) args.push(`--log-output=${logFile}`);
+
+    const proc = spawn(this.iosBinary, args, { stdio: 'ignore', detached: true });
+    proc.unref();
+    return proc;
+  }
+
+  /**
+   * Stop a running WebDriverAgent process (and its process group).
+   */
+  public stopWebDriverAgent(proc: ChildProcess): void {
+    if (proc.pid) {
+      process.kill(-proc.pid);
+    }
+  }
+
+  /**
+   * Reboot the device.
+   * Uses: `ios reboot --udid <udid>` 
+   */
+  public async rebootDevice(udid: string): Promise<void> {
+    await this.ensureTunnelForDevice(udid);
+    try {
+      await execa(this.iosBinary, ['reboot', `--udid=${udid}`]);
+    } catch (err: any) {
+      throw new Error(`Reboot failed: ${err.stderr || err.message}`);
+    }
+  }
+
+  /**
+   * Launch an installed app by bundle ID.
+   * If opts.wait is true, returns a ChildProcess streaming logs;
+   * otherwise resolves when launch is triggered.
+   * Uses: `ios launch <bundleId> [--kill-existing] [--wait] --udid <udid>` 
+   */
+  public async launchApp(
+    udid: string,
+    bundleId: string,
+    opts?: { killExisting?: boolean; wait?: boolean }
+  ): Promise<ChildProcess | void> {
+    await this.ensureTunnelForDevice(udid);
+
+    const args = ['launch', bundleId, `--udid=${udid}`];
+    if (opts?.killExisting) args.push('--kill-existing');
+    if (opts?.wait) args.push('--wait');
+
+    if (opts?.wait) {
+      const proc = spawn(this.iosBinary, args, { stdio: 'inherit', detached: true });
+      proc.unref();
+      return proc;
+    } else {
+      try {
+        await execa(this.iosBinary, args);
+      } catch (err: any) {
+        throw new Error(`Launch failed: ${err.stderr || err.message}`);
+      }
+    }
+  }
+
+  /**
+   * Stop the tunnel daemon if it was started.
+   */
+  public stopTunnel(): void {
+    if (this.tunnelProcess && this.tunnelStarted) {
+      process.kill(-this.tunnelProcess.pid!);
+      this.tunnelStarted = false;
+    }
+  }
+}
