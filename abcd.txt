@@ -1,15 +1,15 @@
-#!/usr/bin/env bash
-# Re-sign an iOS .ipa or .app WITHOUT changing Mach-O UUIDs (so original dSYM still matches).
-# It signs: main app, Frameworks/*.framework, Frameworks/*.dylib, PlugIns/*.appex, Watch/*.app
-# Then repackages to an .ipa (or copies .app) as requested.
+#!/bin/zsh
+# Re-sign an iOS .ipa or .app WITHOUT changing Mach-O UUIDs (keeps original dSYMs valid).
+# Works in zsh on macOS. Signs: main .app, Frameworks/*.framework, Frameworks/*.dylib, PlugIns/*.appex, Watch/*.app
+# Repackages to .ipa (or outputs .app) as requested.
 
 set -euo pipefail
 
 # ---------- Usage ----------
-if [ "$#" -lt 4 ]; then
+if [[ $# -lt 4 ]]; then
   echo "Usage: $0 <CERTIFICATE_NAME> <PROVISIONING_PROFILE> <INPUT_IPA_OR_APP> <OUTPUT_IPA_OR_APP>"
   echo " Example:"
-  echo "  $0 'iPhone Distribution: Your Org' ./profile.mobileprovision ./Original.ipa ./Resigned.ipa"
+  echo "  $0 'Apple Distribution: Your Org' ./profile.mobileprovision ./Original.ipa ./Resigned.ipa"
   exit 1
 fi
 
@@ -25,179 +25,187 @@ WORKDIR="$(mktemp -d)"
 PAYLOADDIR="$WORKDIR/Payload"
 mkdir -p "$PAYLOADDIR"
 
-cleanup() { rm -rf "$WORKDIR"; }
+function cleanup {
+  rm -rf "$WORKDIR"
+}
 trap cleanup EXIT
 
 # ---------- Helpers ----------
+# Return CFBundleExecutable full path for a .app/.appex bundle, or empty string.
 bundle_exec_path() {
-  local bundle="$1" infoplist="$bundle/Info.plist"
-  if [ ! -f "$infoplist" ]; then echo ""; return; fi
+  local bundle="$1"
+  local infoplist="$bundle/Info.plist"
+  [[ -f "$infoplist" ]] || { echo ""; return 0; }
   local execname
   execname="$($PLISTBUDDY -c 'Print :CFBundleExecutable' "$infoplist" 2>/dev/null || true)"
-  if [ -n "${execname:-}" ] && [ -f "$bundle/$execname" ]; then
+  if [[ -n "${execname:-}" && -f "$bundle/$execname" ]]; then
     echo "$bundle/$execname"
   else
     echo ""
   fi
 }
 
+# Grab UUID lines for a Mach-O (fat or thin).
 uuid_of() {
   local bin="$1"
-  if [ -f "$bin" ]; then
-    dwarfdump --uuid "$bin" 2>/dev/null | awk '{$1=""; print substr($0,2)}'
-  fi
+  [[ -f "$bin" ]] || { echo ""; return 0; }
+  # Format: "UUID: XXXXX (arm64) <name>" → we keep everything after "UUID:"
+  dwarfdump --uuid "$bin" 2>/dev/null | awk '{$1=""; print substr($0,2)}'
 }
 
+# Dump current entitlements (if any) from a signed item to a temp file.
 dump_entitlements() {
-  local item="$1" out="$2"
+  local item="$1"
+  local out="$2"
   if codesign -d --entitlements :- "$item" 2>/dev/null > "$out"; then
-    [ -s "$out" ] || rm -f "$out"   # empty → no entitlements
+    [[ -s "$out" ]] || rm -f "$out"   # empty → no entitlements; remove file
   else
     rm -f "$out"
   fi
 }
 
+# Sign a single bundle or file WITHOUT touching code segment
 sign_item() {
   local path="$1"
   local ent_tmp="$WORKDIR/ents.plist"
 
-  # Remove previous code signature for bundles
+  # Remove previous signature for bundle dirs; replace embedded.profile for app/appex
   if [[ "$path" == *.app || "$path" == *.appex || "$path" == *.framework ]]; then
     rm -rf "$path/_CodeSignature" 2>/dev/null || true
-    # Only app/appex bundles embed provisioning profiles
     if [[ "$path" == *.app || "$path" == *.appex ]]; then
       cp -f "$PROFILE" "$path/embedded.mobileprovision"
     fi
   fi
 
   dump_entitlements "$path" "$ent_tmp"
-  if [ -f "$ent_tmp" ]; then
-    codesign -f -s "$CERT" --timestamp=none --entitlements "$ent_tmp" "$path"
+  if [[ -f "$ent_tmp" ]]; then
+    /usr/bin/codesign -f -s "$CERT" --timestamp=none --entitlements "$ent_tmp" "$path"
     rm -f "$ent_tmp"
   else
-    codesign -f -s "$CERT" --timestamp=none "$path"
+    /usr/bin/codesign -f -s "$CERT" --timestamp=none "$path"
   fi
 }
 
+# Walk and sign nested content in correct order (frameworks→extensions→watch→bundle)
 sign_bundle_tree() {
   local appdir="$1"
 
-  # 1) Frameworks & loose dylibs (sign frameworks as bundles)
-  if [ -d "$appdir/Frameworks" ]; then
-    # frameworks
-    find "$appdir/Frameworks" -type d -name "*.framework" -print0 | while IFS= read -r -d '' fw; do
+  # 1) Frameworks & loose dylibs
+  if [[ -d "$appdir/Frameworks" ]]; then
+    # frameworks as bundles
+    /usr/bin/find "$appdir/Frameworks" -type d -name "*.framework" -print0 | while IFS= read -r -d '' fw; do
       sign_item "$fw"
     done
-    # dylibs
-    find "$appdir/Frameworks" -type f -name "*.dylib" -print0 | while IFS= read -r -d '' dyl; do
+    # loose dylibs (any executable file with any execute bit set)
+    /usr/bin/find "$appdir/Frameworks" -type f \( -name "*.dylib" -o -perm -111 \) -print0 | while IFS= read -r -d '' dyl; do
       sign_item "$dyl"
     done
   fi
 
-  # 2) App extensions (sign their frameworks first, then the appex)
-  if [ -d "$appdir/PlugIns" ]; then
-    find "$appdir/PlugIns" -type d -name "*.appex" -print0 | while IFS= read -r -d '' appex; do
+  # 2) App Extensions (sign their inner frameworks first, then the appex bundle)
+  if [[ -d "$appdir/PlugIns" ]]; then
+    /usr/bin/find "$appdir/PlugIns" -type d -name "*.appex" -print0 | while IFS= read -r -d '' appex; do
       sign_bundle_tree "$appex"
       sign_item "$appex"
     done
   fi
 
   # 3) Watch apps
-  if [ -d "$appdir/Watch" ]; then
-    find "$appdir/Watch" -type d -name "*.app" -print0 | while IFS= read -r -d '' wapp; do
+  if [[ -d "$appdir/Watch" ]]; then
+    /usr/bin/find "$appdir/Watch" -type d -name "*.app" -print0 | while IFS= read -r -d '' wapp; do
       sign_bundle_tree "$wapp"
       sign_item "$wapp"
     done
   fi
 }
 
+# Record UUIDs for bundle tree into an assoc array (path → uuid-lines)
+typeset -A UUIDS_BEFORE
 record_uuids_for_tree() {
   local root="$1"
-  local -n _arr="$2"         # nameref to assoc array
-
-  # main exec if bundle
+  # main exec if present
   if [[ "$root" == *.app || "$root" == *.appex ]]; then
     local exe="$(bundle_exec_path "$root")"
-    [ -n "$exe" ] && _arr["$exe"]="$(uuid_of "$exe")"
+    [[ -n "$exe" ]] && UUIDS_BEFORE["$exe"]="$(uuid_of "$exe")"
   fi
-
-  # any executable file inside Frameworks (framework bins & dylibs)
-  if [ -d "$root/Frameworks" ]; then
-    while IFS= read -r -d '' b; do _arr["$b"]="$(uuid_of "$b")"; done \
-      < <(find "$root/Frameworks" -type f \( -name "*.dylib" -o -perm +111 \) -print0)
+  # frameworks/dylibs
+  if [[ -d "$root/Frameworks" ]]; then
+    while IFS= read -r -d '' b; do
+      UUIDS_BEFORE["$b"]="$(uuid_of "$b")"
+    done < <(/usr/bin/find "$root/Frameworks" -type f \( -name "*.dylib" -o -perm -111 \) -print0)
   fi
-
-  # recurse into appex & watch apps
-  if [ -d "$root/PlugIns" ]; then
-    while IFS= read -r -d '' appex; do record_uuids_for_tree "$appex" _arr; done \
-      < <(find "$root/PlugIns" -type d -name "*.appex" -print0)
+  # recurse into appex & watch
+  if [[ -d "$root/PlugIns" ]]; then
+    while IFS= read -r -d '' appex; do
+      record_uuids_for_tree "$appex"
+    done < <(/usr/bin/find "$root/PlugIns" -type d -name "*.appex" -print0)
   fi
-  if [ -d "$root/Watch" ]; then
-    while IFS= read -r -d '' wapp; do record_uuids_for_tree "$wapp" _arr; done \
-      < <(find "$root/Watch" -type d -name "*.app" -print0)
+  if [[ -d "$root/Watch" ]]; then
+    while IFS= read -r -d '' wapp; do
+      record_uuids_for_tree "$wapp"
+    done < <(/usr/bin/find "$root/Watch" -type d -name "*.app" -print0)
   fi
 }
 
 # ---------- Unpack input ----------
 APPDIR=""
 if [[ "$INPUT" == *.ipa ]]; then
-  unzip -q "$INPUT" -d "$WORKDIR"
-  APPDIR="$(find "$WORKDIR/Payload" -type d -name "*.app" | head -n1)"
-  [ -n "$APPDIR" ] || { echo "Error: .app not found in IPA"; exit 1; }
+  /usr/bin/unzip -q "$INPUT" -d "$WORKDIR"
+  APPDIR="$(/usr/bin/find "$WORKDIR/Payload" -type d -name "*.app" | head -n1)"
+  [[ -n "$APPDIR" ]] || { echo "Error: .app not found in IPA"; exit 1; }
 elif [[ "$INPUT" == *.app ]]; then
-  cp -R "$INPUT" "$PAYLOADDIR/"
-  APPDIR="$(find "$PAYLOADDIR" -type d -name "*.app" | head -n1)"
+  /bin/cp -R "$INPUT" "$PAYLOADDIR/"
+  APPDIR="$(/usr/bin/find "$PAYLOADDIR" -type d -name "*.app" | head -n1)"
 else
   echo "Error: INPUT must be .ipa or .app"; exit 1
 fi
 
 # ---------- UUIDs BEFORE ----------
-declare -A BEFORE
-record_uuids_for_tree "$APPDIR" BEFORE
+record_uuids_for_tree "$APPDIR"
 
-# also replace top-level embedded.mobileprovision
-cp -f "$PROFILE" "$APPDIR/embedded.mobileprovision"
+# ensure top-level embedded.mobileprovision uses the provided profile
+/bin/cp -f "$PROFILE" "$APPDIR/embedded.mobileprovision"
 
-# ---------- Sign nested → Sign app ----------
+# ---------- Sign nested → then the main app ----------
 sign_bundle_tree "$APPDIR"
 rm -rf "$APPDIR/_CodeSignature" 2>/dev/null || true
 sign_item "$APPDIR"
 
-# ---------- UUIDs AFTER (and report) ----------
+# ---------- UUIDs AFTER + report ----------
 echo
 echo "=========== UUID CHECK (Before vs After) ==========="
-MISMATCH=0
-for path in "${!BEFORE[@]}"; do
-  BEFORE_UUID="${BEFORE[$path]}"
-  AFTER_UUID="$(uuid_of "$path")"
+local mismatch=0
+for path in ${(k)UUIDS_BEFORE}; do
+  local before="${UUIDS_BEFORE[$path]}"
+  local after="$(uuid_of "$path")"
   echo "$path"
-  echo "  BEFORE: $BEFORE_UUID"
-  echo "  AFTER : $AFTER_UUID"
-  if [ "$BEFORE_UUID" != "$AFTER_UUID" ]; then
+  echo "  BEFORE: $before"
+  echo "  AFTER : $after"
+  if [[ "$before" != "$after" ]]; then
     echo "  !!! MISMATCH"
-    MISMATCH=1
+    mismatch=1
   fi
 done
 echo "===================================================="
 echo
-if [ "$MISMATCH" -ne 0 ]; then
-  echo "WARNING: One or more UUIDs changed. (This script never strips/thins—if UUID changed, the input was already altered or a tool modified a binary.)"
+if [[ $mismatch -ne 0 ]]; then
+  echo "WARNING: One or more UUIDs changed. (This script never strips/thins; a change means the input was previously modified by some other tool.)"
 else
   echo "Success: All UUIDs unchanged. Your original dSYM(s) will match."
 fi
 echo
 
-# ---------- Output: rebuild IPA or copy .app ----------
+# ---------- Output (.ipa or .app) ----------
 if [[ "$OUTPUT" == *.ipa ]]; then
-  # ensure Payload is at root level
-  if [ ! -d "$WORKDIR/Payload" ]; then
+  # ensure Payload is at root
+  if [[ ! -d "$WORKDIR/Payload" ]]; then
     mkdir -p "$WORKDIR/Payload"
-    mv "$APPDIR" "$WORKDIR/Payload/"
+    /bin/mv "$APPDIR" "$WORKDIR/Payload/"
   fi
-  (cd "$WORKDIR" && zip -qr "$OUTPUT" Payload)
+  (cd "$WORKDIR" && /usr/bin/zip -qr "$OUTPUT" Payload)
   echo "Wrote IPA: $OUTPUT"
 elif [[ "$OUTPUT" == *.app ]]; then
-  cp -R "$APPDIR" "$OUTPUT"
+  /bin/cp -R "$APPDIR" "$OUTPUT"
   echo "Wrote app bundle: $OUTPUT"
 else
   echo "Error: OUTPUT must be .ipa or .app"; exit 1
