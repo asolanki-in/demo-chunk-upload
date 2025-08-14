@@ -1,348 +1,204 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Re-sign an iOS .ipa or .app WITHOUT changing Mach-O UUIDs (so original dSYM still matches).
+# It signs: main app, Frameworks/*.framework, Frameworks/*.dylib, PlugIns/*.appex, Watch/*.app
+# Then repackages to an .ipa (or copies .app) as requested.
 
-# Configuration
-ITERATIONS=3
-OUTPUT_FILE="launch_times.txt"
-TRACE_DIR="traces"
+set -euo pipefail
 
-# Colors for output
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# ---------- Usage ----------
+if [ "$#" -lt 4 ]; then
+  echo "Usage: $0 <CERTIFICATE_NAME> <PROVISIONING_PROFILE> <INPUT_IPA_OR_APP> <OUTPUT_IPA_OR_APP>"
+  echo " Example:"
+  echo "  $0 'iPhone Distribution: Your Org' ./profile.mobileprovision ./Original.ipa ./Resigned.ipa"
+  exit 1
+fi
 
-# Create directories
-mkdir -p "$TRACE_DIR"
+CERT="$1"
+PROFILE="$2"
+INPUT="$3"
+OUTPUT="$4"
 
-# Function to get connected devices
-get_devices() {
-    xcrun xctrace list devices 2>/dev/null
+PLISTBUDDY="/usr/libexec/PlistBuddy"
+
+# ---------- Workspace ----------
+WORKDIR="$(mktemp -d)"
+PAYLOADDIR="$WORKDIR/Payload"
+mkdir -p "$PAYLOADDIR"
+
+cleanup() { rm -rf "$WORKDIR"; }
+trap cleanup EXIT
+
+# ---------- Helpers ----------
+bundle_exec_path() {
+  local bundle="$1" infoplist="$bundle/Info.plist"
+  if [ ! -f "$infoplist" ]; then echo ""; return; fi
+  local execname
+  execname="$($PLISTBUDDY -c 'Print :CFBundleExecutable' "$infoplist" 2>/dev/null || true)"
+  if [ -n "${execname:-}" ] && [ -f "$bundle/$execname" ]; then
+    echo "$bundle/$execname"
+  else
+    echo ""
+  fi
 }
 
-# Function to extract bundle ID from app
-get_bundle_id() {
-    local app_path="$1"
-    /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app_path/Info.plist"
+uuid_of() {
+  local bin="$1"
+  if [ -f "$bin" ]; then
+    dwarfdump --uuid "$bin" 2>/dev/null | awk '{$1=""; print substr($0,2)}'
+  fi
 }
 
-# Function to measure launch time using xctrace
-measure_with_xctrace() {
-    local app_path="$1"
-    local device_id="$2"
-    local iteration="$3"
-    local bundle_id="$4"
-    
-    echo -e "${BLUE}Running measurement $iteration...${NC}"
-    
-    # Create unique trace file
-    trace_file="$TRACE_DIR/trace_${iteration}.trace"
-    
-    # Kill existing instance of the app
-    xcrun simctl terminate "$device_id" "$bundle_id" 2>/dev/null
-    
-    # Clear app data
-    xcrun simctl uninstall "$device_id" "$bundle_id" 2>/dev/null
-    xcrun simctl install "$device_id" "$app_path" 2>/dev/null
-    
-    # Run xctrace
-    xctrace record --device "$device_id" \
-            --template 'Time Profiler' \
-            --output "$trace_file" \
-            --launch "$app_path" \
-            --terminate \
-            --time-limit 10s \
-            2>/dev/null
-    
-    # Extract launch time data using xctrace
-    launch_data=$(xctrace examine --input "$trace_file" --tool 'Time Profiler' 2>/dev/null)
-    
-    # Parse and store launch time
-    launch_time=$(echo "$launch_data" | grep -A 5 "Main Thread" | grep "Total Time" | awk '{print $4}')
-    if [ ! -z "$launch_time" ]; then
-        echo "Launch $iteration: ${launch_time}ms" >> "$OUTPUT_FILE"
+dump_entitlements() {
+  local item="$1" out="$2"
+  if codesign -d --entitlements :- "$item" 2>/dev/null > "$out"; then
+    [ -s "$out" ] || rm -f "$out"   # empty → no entitlements
+  else
+    rm -f "$out"
+  fi
+}
+
+sign_item() {
+  local path="$1"
+  local ent_tmp="$WORKDIR/ents.plist"
+
+  # Remove previous code signature for bundles
+  if [[ "$path" == *.app || "$path" == *.appex || "$path" == *.framework ]]; then
+    rm -rf "$path/_CodeSignature" 2>/dev/null || true
+    # Only app/appex bundles embed provisioning profiles
+    if [[ "$path" == *.app || "$path" == *.appex ]]; then
+      cp -f "$PROFILE" "$path/embedded.mobileprovision"
     fi
+  fi
+
+  dump_entitlements "$path" "$ent_tmp"
+  if [ -f "$ent_tmp" ]; then
+    codesign -f -s "$CERT" --timestamp=none --entitlements "$ent_tmp" "$path"
+    rm -f "$ent_tmp"
+  else
+    codesign -f -s "$CERT" --timestamp=none "$path"
+  fi
 }
 
-# Function to measure using modern simctl
-measure_with_simctl() {
-    local bundle_id="$1"
-    local device_id="$2"
-    local iteration="$3"
-    
-    echo -e "${BLUE}Running measurement $iteration...${NC}"
-    
-    # Clear app state
-    xcrun simctl terminate "$device_id" "$bundle_id" 2>/dev/null
-    sleep 2
-    
-    # Measure launch
-    start_time=$(gdate +%s%N 2>/dev/null || date +%s%N)
-    xcrun simctl launch "$device_id" "$bundle_id" 2>/dev/null
-    end_time=$(gdate +%s%N 2>/dev/null || date +%s%N)
-    
-    # Calculate duration in milliseconds
-    duration=$(( ($end_time - $start_time) / 1000000 ))
-    echo "Launch $iteration: ${duration}ms" >> "$OUTPUT_FILE"
-}
+sign_bundle_tree() {
+  local appdir="$1"
 
-# Function to check Xcode version
-check_xcode_version() {
-    xcodebuild -version | head -n 1 | grep -o "[0-9]*\.[0-9]*"
-}
-
-# Main script
-main() {
-    echo -e "${GREEN}iOS App Launch Time Profiler (Xcode 15/16)${NC}"
-    echo -e "${GREEN}=====================================${NC}"
-    
-    # Check if IPA/app path provided
-    if [ "$#" -ne 1 ]; then
-        echo "Usage: $0 <path-to-app-or-ipa>"
-        exit 1
-    fi
-    
-    # Check Xcode version
-    XCODE_VERSION=$(check_xcode_version)
-    echo -e "${GREEN}Detected Xcode version: $XCODE_VERSION${NC}"
-    
-    APP_PATH="$1"
-    
-    # Verify app path exists
-    if [ ! -d "$APP_PATH" ]; then
-        echo "Error: App path does not exist: $APP_PATH"
-        exit 1
-    }
-    
-    # Extract bundle identifier
-    BUNDLE_ID=$(get_bundle_id "$APP_PATH")
-    if [ -z "$BUNDLE_ID" ]; then
-        echo "Error: Could not extract bundle identifier"
-        exit 1
-    }
-    
-    echo -e "${GREEN}Testing app: $BUNDLE_ID${NC}"
-    echo -e "${GREEN}Available devices:${NC}"
-    get_devices
-    
-    read -p "Enter device ID (or press enter for booted simulator): " DEVICE_ID
-    DEVICE_ID=${DEVICE_ID:-"booted"}
-    
-    # Clear previous results
-    rm -f "$OUTPUT_FILE"
-    rm -rf "$TRACE_DIR"/*
-    
-    echo -e "${GREEN}Starting measurements...${NC}"
-    echo "Launch Time Results for $BUNDLE_ID" > "$OUTPUT_FILE"
-    echo "=================================" >> "$OUTPUT_FILE"
-    echo "Xcode Version: $XCODE_VERSION" >> "$OUTPUT_FILE"
-    echo "Date: $(date)" >> "$OUTPUT_FILE"
-    echo "=================================" >> "$OUTPUT_FILE"
-    
-    for i in $(seq 1 $ITERATIONS); do
-        if [[ "$DEVICE_ID" == "booted" || "$DEVICE_ID" =~ "simulator" ]]; then
-            measure_with_simctl "$BUNDLE_ID" "$DEVICE_ID" "$i"
-        else
-            measure_with_xctrace "$APP_PATH" "$DEVICE_ID" "$i" "$BUNDLE_ID"
-        fi
-        
-        # Wait between iterations
-        sleep 5
+  # 1) Frameworks & loose dylibs (sign frameworks as bundles)
+  if [ -d "$appdir/Frameworks" ]; then
+    # frameworks
+    find "$appdir/Frameworks" -type d -name "*.framework" -print0 | while IFS= read -r -d '' fw; do
+      sign_item "$fw"
     done
-    
-    # Calculate average
-    average=$(awk '/Launch/ {sum+=$3; count++} END {print sum/count}' "$OUTPUT_FILE")
-    echo -e "\nAverage launch time: ${average}ms" >> "$OUTPUT_FILE"
-    
-    echo -e "${GREEN}Measurements complete. Results saved in $OUTPUT_FILE${NC}"
-    cat "$OUTPUT_FILE"
-    
-    echo -e "\n${GREEN}Trace files are saved in $TRACE_DIR directory${NC}"
+    # dylibs
+    find "$appdir/Frameworks" -type f -name "*.dylib" -print0 | while IFS= read -r -d '' dyl; do
+      sign_item "$dyl"
+    done
+  fi
+
+  # 2) App extensions (sign their frameworks first, then the appex)
+  if [ -d "$appdir/PlugIns" ]; then
+    find "$appdir/PlugIns" -type d -name "*.appex" -print0 | while IFS= read -r -d '' appex; do
+      sign_bundle_tree "$appex"
+      sign_item "$appex"
+    done
+  fi
+
+  # 3) Watch apps
+  if [ -d "$appdir/Watch" ]; then
+    find "$appdir/Watch" -type d -name "*.app" -print0 | while IFS= read -r -d '' wapp; do
+      sign_bundle_tree "$wapp"
+      sign_item "$wapp"
+    done
+  fi
 }
 
-main "$@"
+record_uuids_for_tree() {
+  local root="$1"
+  local -n _arr="$2"         # nameref to assoc array
 
+  # main exec if bundle
+  if [[ "$root" == *.app || "$root" == *.appex ]]; then
+    local exe="$(bundle_exec_path "$root")"
+    [ -n "$exe" ] && _arr["$exe"]="$(uuid_of "$exe")"
+  fi
 
+  # any executable file inside Frameworks (framework bins & dylibs)
+  if [ -d "$root/Frameworks" ]; then
+    while IFS= read -r -d '' b; do _arr["$b"]="$(uuid_of "$b")"; done \
+      < <(find "$root/Frameworks" -type f \( -name "*.dylib" -o -perm +111 \) -print0)
+  fi
 
-
-
-import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
-import { EventEmitter } from 'events';
-import { mkdirSync, createWriteStream, WriteStream } from 'fs';
-import { join } from 'path';
-
-export interface LogStreamerOptions {
-  /** How many lines to keep in the in-memory buffer per device */
-  bufferSize?: number;
-  /** Directory to write per-device log files into */
-  logDirectory?: string;
+  # recurse into appex & watch apps
+  if [ -d "$root/PlugIns" ]; then
+    while IFS= read -r -d '' appex; do record_uuids_for_tree "$appex" _arr; done \
+      < <(find "$root/PlugIns" -type d -name "*.appex" -print0)
+  fi
+  if [ -d "$root/Watch" ]; then
+    while IFS= read -r -d '' wapp; do record_uuids_for_tree "$wapp" _arr; done \
+      < <(find "$root/Watch" -type d -name "*.app" -print0)
+  fi
 }
 
-interface Session {
-  process: ChildProcessWithoutNullStreams;
-  buffer: RingBuffer<string>;
-  remainder: string;
-  fileStream: WriteStream;
-  stopped: boolean;
-}
+# ---------- Unpack input ----------
+APPDIR=""
+if [[ "$INPUT" == *.ipa ]]; then
+  unzip -q "$INPUT" -d "$WORKDIR"
+  APPDIR="$(find "$WORKDIR/Payload" -type d -name "*.app" | head -n1)"
+  [ -n "$APPDIR" ] || { echo "Error: .app not found in IPA"; exit 1; }
+elif [[ "$INPUT" == *.app ]]; then
+  cp -R "$INPUT" "$PAYLOADDIR/"
+  APPDIR="$(find "$PAYLOADDIR" -type d -name "*.app" | head -n1)"
+else
+  echo "Error: INPUT must be .ipa or .app"; exit 1
+fi
 
-/** Fixed-size ring buffer to avoid O(n) shifts */
-class RingBuffer<T> {
-  private buf: (T | undefined)[];
-  private capacity: number;
-  private head = 0;
-  private size = 0;
+# ---------- UUIDs BEFORE ----------
+declare -A BEFORE
+record_uuids_for_tree "$APPDIR" BEFORE
 
-  constructor(capacity: number) {
-    this.capacity = capacity;
-    this.buf = new Array(capacity);
-  }
+# also replace top-level embedded.mobileprovision
+cp -f "$PROFILE" "$APPDIR/embedded.mobileprovision"
 
-  push(item: T) {
-    this.buf[this.head] = item;
-    this.head = (this.head + 1) % this.capacity;
-    if (this.size < this.capacity) this.size++;
-  }
+# ---------- Sign nested → Sign app ----------
+sign_bundle_tree "$APPDIR"
+rm -rf "$APPDIR/_CodeSignature" 2>/dev/null || true
+sign_item "$APPDIR"
 
-  /** In-chronological order */
-  getAll(): T[] {
-    const out: T[] = [];
-    const start = this.size === this.capacity ? this.head : 0;
-    for (let i = 0; i < this.size; i++) {
-      const idx = (start + i) % this.capacity;
-      const v = this.buf[idx];
-      if (v !== undefined) out.push(v);
-    }
-    return out;
-  }
-}
+# ---------- UUIDs AFTER (and report) ----------
+echo
+echo "=========== UUID CHECK (Before vs After) ==========="
+MISMATCH=0
+for path in "${!BEFORE[@]}"; do
+  BEFORE_UUID="${BEFORE[$path]}"
+  AFTER_UUID="$(uuid_of "$path")"
+  echo "$path"
+  echo "  BEFORE: $BEFORE_UUID"
+  echo "  AFTER : $AFTER_UUID"
+  if [ "$BEFORE_UUID" != "$AFTER_UUID" ]; then
+    echo "  !!! MISMATCH"
+    MISMATCH=1
+  fi
+done
+echo "===================================================="
+echo
+if [ "$MISMATCH" -ne 0 ]; then
+  echo "WARNING: One or more UUIDs changed. (This script never strips/thins—if UUID changed, the input was already altered or a tool modified a binary.)"
+else
+  echo "Success: All UUIDs unchanged. Your original dSYM(s) will match."
+fi
+echo
 
-export class IOSLogStreamer extends EventEmitter {
-  private sessions = new Map<string, Session>();
-  private bufferSize: number;
-  private logDirectory: string;
-
-  constructor(opts: LogStreamerOptions = {}) {
-    super();
-    this.bufferSize = opts.bufferSize ?? 1000;
-    this.logDirectory = opts.logDirectory ?? './logs';
-
-    // recursive: true is idempotent if dir already exists
-    mkdirSync(this.logDirectory, { recursive: true });
-  }
-
-  /**
-   * Start streaming logs for the given device UDID.
-   * @throws if already streaming for this UDID
-   */
-  public startLogs(udid: string): void {
-    if (this.sessions.has(udid)) {
-      throw new Error(`Logs already streaming for device ${udid}`);
-    }
-
-    const proc = spawn('idevicesyslog', ['-u', udid], {
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    const buffer = new RingBuffer<string>(this.bufferSize);
-    const filePath = join(this.logDirectory, `${udid}.log`);
-    const fileStream = createWriteStream(filePath, { flags: 'a' });
-
-    const session: Session = {
-      process: proc,
-      buffer,
-      remainder: '',
-      fileStream,
-      stopped: false
-    };
-    this.sessions.set(udid, session);
-
-    // Handle spawn errors (e.g. binary not found)
-    proc.on('error', err => {
-      this.emit('error', udid, err);
-      this.cleanupSession(udid);
-    });
-
-    // File-write errors
-    fileStream.on('error', err => {
-      this.emit('error', udid, err);
-      // we keep going—UI might recover, but you could also cleanup here
-    });
-
-    // Stdout data with chunk-boundary handling
-    proc.stdout.on('data', (chunk: Buffer) => {
-      const text = session.remainder + chunk.toString('utf8');
-      const parts = text.split(/\r?\n/);
-      session.remainder = parts.pop() ?? '';
-
-      for (const line of parts) {
-        if (!line.trim()) continue;
-
-        buffer.push(line);
-        fileStream.write(line + '\n');
-        this.emit('log', udid, line);
-      }
-    });
-
-    // Stderr → treated as errors
-    proc.stderr.on('data', (errBuf: Buffer) => {
-      const msg = errBuf.toString('utf8').trim();
-      if (msg) {
-        this.emit('error', udid, new Error(msg));
-      }
-    });
-
-    // Clean shutdown
-    proc.on('close', (code, signal) => {
-      if (!session.stopped) {
-        // if we didn't explicitly stop, still treat as stopped
-        this.emit('stopped', udid, { code, signal });
-      }
-      this.cleanupSession(udid);
-    });
-
-    this.emit('started', udid);
-  }
-
-  /**
-   * Stop streaming logs for the given UDID.
-   * @throws if there is no active session for this UDID
-   */
-  public stopLogs(udid: string): void {
-    const session = this.sessions.get(udid);
-    if (!session) {
-      throw new Error(`No active logging session for device ${udid}`);
-    }
-    if (session.process.killed) return;
-
-    session.stopped = true;
-    try {
-      session.process.kill('SIGINT');
-    } catch (err: any) {
-      // ignore if process already gone
-      if (err.code !== 'ESRCH') {
-        this.emit('error', udid, err);
-      }
-    }
-  }
-
-  /**
-   * Retrieve the current in-memory buffer of recent log lines.
-   */
-  public getBufferedLogs(udid: string): string[] {
-    const session = this.sessions.get(udid);
-    if (!session) {
-      throw new Error(`No active logging session for device ${udid}`);
-    }
-    return session.buffer.getAll();
-  }
-
-  /** Internal cleanup of session resources */
-  private cleanupSession(udid: string) {
-    const s = this.sessions.get(udid);
-    if (!s) return;
-    s.fileStream.end();
-    this.sessions.delete(udid);
-  }
-}
-
-// Export a singleton instance
-export default new IOSLogStreamer();
+# ---------- Output: rebuild IPA or copy .app ----------
+if [[ "$OUTPUT" == *.ipa ]]; then
+  # ensure Payload is at root level
+  if [ ! -d "$WORKDIR/Payload" ]; then
+    mkdir -p "$WORKDIR/Payload"
+    mv "$APPDIR" "$WORKDIR/Payload/"
+  fi
+  (cd "$WORKDIR" && zip -qr "$OUTPUT" Payload)
+  echo "Wrote IPA: $OUTPUT"
+elif [[ "$OUTPUT" == *.app ]]; then
+  cp -R "$APPDIR" "$OUTPUT"
+  echo "Wrote app bundle: $OUTPUT"
+else
+  echo "Error: OUTPUT must be .ipa or .app"; exit 1
+fi
