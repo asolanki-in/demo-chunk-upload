@@ -1,42 +1,38 @@
 import argparse
 import os
 import subprocess
-import json
 import re
 import logging
+import xml.etree.ElementTree as ET
 
 def extract_trace_uuids(trace_path):
     """
-    Use 'xcrun xctrace export --format json' to extract UUIDs from the .trace file.
+    Use 'xcrun xctrace export --toc' to extract UUIDs from the .trace file (XML format).
     """
+    xml_out = "/tmp/trace_toc.xml"
     try:
-        result = subprocess.run(
-            ["xcrun", "xctrace", "export", "--input", trace_path, "--format", "json"],
-            capture_output=True, text=True, check=True
+        subprocess.run(
+            ["xcrun", "xctrace", "export", "--input", trace_path, "--output", xml_out, "--toc"],
+            check=True, capture_output=True, text=True
         )
     except subprocess.CalledProcessError as e:
-        logging.error(f"Failed to export trace to JSON: {e.stderr}")
+        logging.error(f"Failed to export trace to XML: {e.stderr}")
         raise SystemExit(1)
-    # Parse JSON output for any UUID fields (standard UUID pattern)
+
     uuids = set()
     try:
-        data = json.loads(result.stdout)
-        # Recursively search for uuid-like strings in JSON
-        def find_uuids(node):
-            if isinstance(node, dict):
-                for k, v in node.items():
-                    if isinstance(v, str) and re.match(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-"
-                                                       r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
-                                                       r"[0-9A-Fa-f]{12}$", v):
-                        uuids.add(v.upper())
-                    else:
-                        find_uuids(v)
-            elif isinstance(node, list):
-                for item in node:
-                    find_uuids(item)
-        find_uuids(data)
-    except json.JSONDecodeError as e:
-        logging.error(f"Invalid JSON from xctrace export: {e}")
+        tree = ET.parse(xml_out)
+        root = tree.getroot()
+        # Look for UUID-like strings anywhere in XML
+        for elem in root.iter():
+            if elem.text:
+                text = elem.text.strip()
+                if re.match(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-"
+                            r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+                            r"[0-9A-Fa-f]{12}$", text):
+                    uuids.add(text.upper())
+    except Exception as e:
+        logging.error(f"Failed to parse XML: {e}")
         raise SystemExit(1)
 
     return uuids
@@ -51,7 +47,6 @@ def collect_dsym_uuids(dsym_folder):
         for name in dirs:
             if name.endswith(".dSYM"):
                 dsym_path = os.path.join(root, name)
-                # Run dwarfdump to get all UUIDs for this dSYM
                 try:
                     result = subprocess.run(
                         ["xcrun", "dwarfdump", "--uuid", dsym_path],
@@ -81,7 +76,6 @@ def main():
     dsym_folder = args.dsym_folder
     output_path = args.output or (os.path.splitext(trace_path)[0] + "_symbolicated.trace")
 
-    # Check inputs
     if not os.path.isfile(trace_path):
         logging.error(f"Trace file not found: {trace_path}")
         return
@@ -100,14 +94,12 @@ def main():
     if not dsym_map:
         logging.warning("No .dSYM files found or no UUIDs extracted from them.")
 
-    # Determine which UUIDs are satisfied by available dSYMs
     matched_dsyms = set()
     symbolicated_uuids = []
     missing_uuids = []
 
     for uuid in sorted(required_uuids):
         if uuid in dsym_map:
-            # Mark all dsym paths for this uuid
             for dsym_path in dsym_map[uuid]:
                 matched_dsyms.add(dsym_path)
             symbolicated_uuids.append(uuid)
@@ -121,10 +113,10 @@ def main():
         logging.error("No matching dSYM found for any UUID; aborting symbolication.")
         return
 
-    # Run xctrace symbolicate with the matched dSYMs
     cmd = ["xcrun", "xctrace", "symbolicate", "--input", trace_path, "--output", output_path]
     for dsym_path in matched_dsyms:
         cmd.extend(["--dsym", dsym_path])
+
     logging.info(f"Running symbolicate with dSYM(s): {list(matched_dsyms)}")
     try:
         subprocess.run(cmd, check=True)
