@@ -1,0 +1,37 @@
+import lief
+import sys
+import os
+
+def inject_dylib(binary_path, dylib_path):
+    print(f"Processing: {binary_path}")
+    
+    # 1. Parse the binary
+    binary = lief.parse(binary_path)
+    
+    if not binary:
+        print("Error: Could not parse binary.")
+        sys.exit(1)
+
+    # 2. Add the library dependency
+    # We use @executable_path so the app looks for the dylib in its own folder
+    header_path = f"@executable_path/{os.path.basename(dylib_path)}"
+    print(f"Injecting load command: {header_path}")
+    
+    binary.add_library(header_path)
+    
+    # 3. Write the modified binary back to disk
+    # We overwrite the original file
+    output_path = binary_path 
+    binary.write(output_path)
+    
+    print(f"Success! Modified binary saved to: {output_path}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: python3 inject.py <path_to_app_binary> <path_to_dylib>")
+        sys.exit(1)
+        
+    app_binary = sys.argv[1]
+    dylib_file = sys.argv[2]
+    
+    inject_dylib(app_binary, dylib_file)
