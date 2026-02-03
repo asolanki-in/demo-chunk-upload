@@ -318,3 +318,69 @@ echo "Zipping IPA..."
 zip -qr "patched_insecure.ipa" Payload
 
 echo "Done! Output: patched_insecure.ipa"
+
+-----------
+
+// Minimal QR Code Injector - GUARANTEED TO WORK
+console.log("[*] Minimal QR Code Injector Loading...");
+
+const INJECTED_QR_DATA = "https://google.com";
+
+// This is the ONE method that ALL AVFoundation QR scanners must use
+function hookEssentialQRMethod() {
+	console.log("[*] Waiting for AVMetadataMachineReadableCodeObject to load...");
+
+	const checkInterval = setInterval(() => {
+		if (ObjC.classes.AVMetadataMachineReadableCodeObject) {
+			clearInterval(checkInterval);
+
+			const QRCodeClass = ObjC.classes.AVMetadataMachineReadableCodeObject;
+
+			console.log("[*] Found AVMetadataMachineReadableCodeObject, hooking stringValue...");
+
+			// HOOK THE CRITICAL METHOD
+			Interceptor.attach(QRCodeClass["- stringValue"].implementation, {
+				onEnter: function (args) {
+					// Optional: log when called
+					// console.log("[QR] Getting QR code string value...");
+				},
+				onLeave: function (retval) {
+					if (retval.toInt32() !== 0) {
+						const original = new ObjC.Object(retval).toString();
+
+						// REPLACE WITH OUR DATA
+						const newString = ObjC.classes.NSString.stringWithString_(INJECTED_QR_DATA);
+						retval.replace(newString.handle);
+
+						console.log(`\n[QR INJECTION SUCCESSFUL!]`);
+						console.log(`[*] Original QR: ${original}`);
+						console.log(`[*] Injected: ${INJECTED_QR_DATA}`);
+						console.log(`[*] No camera bypass needed - replacement done!`);
+					}
+				},
+			});
+
+			console.log("[+] SUCCESS: Hooked AVMetadataMachineReadableCodeObject.stringValue");
+			console.log("[+] ANY QR code scanned will now be replaced!");
+		}
+	}, 100);
+}
+
+// Start immediately
+setTimeout(() => {
+	console.log("[*] =========================================");
+	console.log("[*] MINIMAL QR INJECTOR");
+	console.log("[*] =========================================");
+	console.log(`[*] Will inject: ${INJECTED_QR_DATA}`);
+	console.log("[*] =========================================\n");
+
+	hookEssentialQRMethod();
+
+	console.log("\n[*] =========================================");
+	console.log("[*] READY FOR ACTION");
+	console.log("[*] =========================================");
+	console.log("[*] Open any QR scanner app and scan a code.");
+	console.log("[*] The QR data will be replaced automatically.");
+	console.log("[*] =========================================\n");
+}, 500);
+
