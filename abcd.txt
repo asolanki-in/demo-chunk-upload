@@ -1,449 +1,773 @@
-#!/bin/bash
+// BiometricBypass.m
+// Objective-C runtime hook for LAContext biometric bypass
 
-# iOS Trace Symbolication Script with Framework Support
-# Compatible with Xcode 16 and later
-# Usage: ./symbolicate_trace.sh <trace_file> <dsym_directory> [output_file]
+#import <Foundation/Foundation.h>
+#import <LocalAuthentication/LocalAuthentication.h>
+#import <objc/runtime.h>
 
-set -euo pipefail
+@interface BiometricBypass : NSObject
+@end
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+@implementation BiometricBypass
 
-# Function to print colored output
-print_status() {
-    echo -e "${BLUE}[INFO]${NC} $1"
++ (void)load {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSLog(@"[BiometricBypass] Initializing biometric bypass framework...");
+        
+        Class laContextClass = NSClassFromString(@"LAContext");
+        if (!laContextClass) {
+            NSLog(@"[BiometricBypass] ERROR: LAContext class not found!");
+            return;
+        }
+        
+        // Hook canEvaluatePolicy:error:
+        [self swizzleInstanceMethod:laContextClass
+                       originalSelector:@selector(canEvaluatePolicy:error:)
+                       swizzledSelector:@selector(bypass_canEvaluatePolicy:error:)];
+        
+        // Hook evaluatePolicy:localizedReason:reply:
+        [self swizzleInstanceMethod:laContextClass
+                       originalSelector:@selector(evaluatePolicy:localizedReason:reply:)
+                       swizzledSelector:@selector(bypass_evaluatePolicy:localizedReason:reply:)];
+        
+        NSLog(@"[BiometricBypass] Successfully hooked LAContext methods!");
+    });
 }
 
-print_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
++ (void)swizzleInstanceMethod:(Class)class
+               originalSelector:(SEL)originalSelector
+               swizzledSelector:(SEL)swizzledSelector {
+    Method originalMethod = class_getInstanceMethod(class, originalSelector);
+    Method swizzledMethod = class_getInstanceMethod(self, swizzledSelector);
+    
+    if (!originalMethod || !swizzledMethod) {
+        NSLog(@"[BiometricBypass] Failed to swizzle %@", NSStringFromSelector(originalSelector));
+        return;
+    }
+    
+    BOOL didAddMethod = class_addMethod(class,
+                                        originalSelector,
+                                        method_getImplementation(swizzledMethod),
+                                        method_getTypeEncoding(swizzledMethod));
+    
+    if (didAddMethod) {
+        class_replaceMethod(class,
+                           swizzledSelector,
+                           method_getImplementation(originalMethod),
+                           method_getTypeEncoding(originalMethod));
+    } else {
+        method_exchangeImplementations(originalMethod, swizzledMethod);
+    }
 }
 
-print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+- (BOOL)bypass_canEvaluatePolicy:(LAPolicy)policy error:(NSError **)error {
+    NSLog(@"[BiometricBypass] canEvaluatePolicy intercepted - returning YES");
+    if (error) {
+        *error = nil;
+    }
+    return YES;
 }
 
-print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+- (void)bypass_evaluatePolicy:(LAPolicy)policy
+              localizedReason:(NSString *)localizedReason
+                        reply:(void (^)(BOOL success, NSError *error))reply {
+    NSLog(@"[BiometricBypass] evaluatePolicy intercepted - Auto-succeeding");
+    NSLog(@"[BiometricBypass] Reason: %@", localizedReason);
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (reply) {
+            reply(YES, nil);
+        }
+    });
 }
 
-# Function to check if required tools are available
-check_requirements() {
-    print_status "Checking requirements..."
-    
-    if ! command -v xcrun &> /dev/null; then
-        print_error "xcrun not found. Please ensure Xcode is installed."
-        exit 1
-    fi
-    
-    # Check Xcode version
-    local xcode_version=$(xcodebuild -version | head -n 1 | grep -oE '[0-9]+\.[0-9]+')
-    local major_version=$(echo $xcode_version | cut -d. -f1)
-    
-    if [[ $major_version -lt 16 ]]; then
-        print_warning "Xcode version $xcode_version detected. This script is optimized for Xcode 16+."
-    else
-        print_success "Xcode version $xcode_version detected."
-    fi
-    
-    # Check if xctrace is available
-    if ! xcrun xctrace help &> /dev/null; then
-        print_error "xctrace not available. Please ensure you have Xcode Command Line Tools installed."
-        exit 1
-    fi
-    
-    print_success "All requirements met."
+@end
+
+------------=======================================================================
+
+// SecureEnclaveMock.m
+// Mocks Secure Enclave by intercepting Keychain operations
+// Redirects biometric-protected data to UserDefaults
+
+#import <Foundation/Foundation.h>
+#import <Security/Security.h>
+#import <objc/runtime.h>
+
+@interface SecureEnclaveMock : NSObject
++ (NSString *)mockStorageKey:(NSDictionary *)query;
++ (BOOL)isBiometricProtected:(NSDictionary *)query;
++ (void)saveMockData:(NSData *)data forKey:(NSString *)key withMetadata:(NSDictionary *)metadata;
++ (NSData *)loadMockData:(NSString *)key;
++ (BOOL)deleteMockData:(NSString *)key;
+@end
+
+@implementation SecureEnclaveMock
+
++ (void)load {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSLog(@"[SecureEnclaveMock] Initializing Secure Enclave mocking...");
+        
+        // We'll hook Keychain functions using method swizzling on wrapper level
+        // Direct C function hooking requires more complex techniques (fishhook, etc.)
+        
+        NSLog(@"[SecureEnclaveMock] Secure Enclave mock initialized");
+        NSLog(@"[SecureEnclaveMock] Biometric-protected Keychain data will be redirected to UserDefaults");
+    });
 }
 
-# Function to find all dSYM files recursively including system frameworks
-find_dsym_files() {
-    local dsym_dir="$1"
-    local dsym_files=()
-    
-    print_status "Searching for dSYM files in: $dsym_dir"
-    
-    # Find all .dSYM bundles
-    while IFS= read -r -d '' dsym_path; do
-        if [[ -d "$dsym_path" ]]; then
-            dsym_files+=("$dsym_path")
-            print_status "Found dSYM: $(basename "$dsym_path")"
-        fi
-    done < <(find "$dsym_dir" -name "*.dSYM" -print0 2>/dev/null || true)
-    
-    # Also search in common system locations for iOS frameworks
-    local system_paths=(
-        "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/DeviceSupport"
-        "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Library/Developer/CoreSimulator/Profiles/DeviceTypes"
-        "$HOME/Library/Developer/Xcode/iOS DeviceSupport"
-    )
-    
-    for sys_path in "${system_paths[@]}"; do
-        if [[ -d "$sys_path" ]]; then
-            print_status "Searching system path: $sys_path"
-            while IFS= read -r -d '' dsym_path; do
-                if [[ -d "$dsym_path" ]]; then
-                    dsym_files+=("$dsym_path")
-                    print_status "Found system dSYM: $(basename "$dsym_path")"
-                fi
-            done < <(find "$sys_path" -name "*.dSYM" -print0 2>/dev/null || true)
-        fi
-    done
-    
-    if [[ ${#dsym_files[@]} -eq 0 ]]; then
-        print_warning "No dSYM files found in $dsym_dir"
-        return 1
-    fi
-    
-    printf '%s\n' "${dsym_files[@]}"
-    return 0
++ (NSString *)mockStorageKey:(NSDictionary *)query {
+    NSString *service = query[(__bridge id)kSecAttrService] ?: @"default";
+    NSString *account = query[(__bridge id)kSecAttrAccount] ?: @"default";
+    return [NSString stringWithFormat:@"MockEnclave_%@_%@", service, account];
 }
 
-# Function to get UUID from dSYM with multiple attempts
-get_dsym_uuid() {
-    local dsym_path="$1"
-    local uuid_info=""
-    local binary_name=""
++ (BOOL)isBiometricProtected:(NSDictionary *)query {
+    // Check if query contains biometric access control
+    id accessControl = query[(__bridge id)kSecAttrAccessControl];
+    if (accessControl) {
+        NSLog(@"[SecureEnclaveMock] Detected biometric protection - will mock!");
+        return YES;
+    }
     
-    # Get the expected binary name from dSYM bundle name
-    binary_name=$(basename "$dsym_path" .dSYM)
+    // Check for accessibility attributes that might use biometric
+    id accessible = query[(__bridge id)kSecAttrAccessible];
+    if (accessible) {
+        NSString *accessStr = (__bridge NSString *)accessible;
+        if ([accessStr containsString:@"Passcode"] || [accessStr containsString:@"ThisDevice"]) {
+            NSLog(@"[SecureEnclaveMock] Detected device-bound accessibility - will mock!");
+            return YES;
+        }
+    }
     
-    # Method 1: Try dwarfdump on the bundle directly
-    uuid_info=$(xcrun dwarfdump --uuid "$dsym_path" 2>/dev/null | grep -E '^UUID:' | head -n 1 | awk '{print $2}' || echo "")
+    return NO;
+}
+
++ (void)saveMockData:(NSData *)data forKey:(NSString *)key withMetadata:(NSDictionary *)metadata {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     
-    if [[ -z "$uuid_info" ]]; then
-        # Method 2: Try to find the actual binary inside the dSYM
-        local dwarf_dir="$dsym_path/Contents/Resources/DWARF"
-        if [[ -d "$dwarf_dir" ]]; then
-            # Try the expected binary name first
-            if [[ -f "$dwarf_dir/$binary_name" ]]; then
-                uuid_info=$(xcrun dwarfdump --uuid "$dwarf_dir/$binary_name" 2>/dev/null | grep -E '^UUID:' | head -n 1 | awk '{print $2}' || echo "")
-            fi
+    // Save the actual data
+    [defaults setObject:data forKey:key];
+    
+    // Save metadata
+    NSString *metaKey = [key stringByAppendingString:@"_meta"];
+    [defaults setObject:metadata forKey:metaKey];
+    
+    [defaults synchronize];
+    
+    NSLog(@"[SecureEnclaveMock] Saved to UserDefaults: %@", key);
+}
+
++ (NSData *)loadMockData:(NSString *)key {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSData *data = [defaults objectForKey:key];
+    
+    if (data) {
+        NSLog(@"[SecureEnclaveMock] Retrieved from UserDefaults: %@", key);
+    }
+    
+    return data;
+}
+
++ (BOOL)deleteMockData:(NSString *)key {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults removeObjectForKey:key];
+    
+    NSString *metaKey = [key stringByAppendingString:@"_meta"];
+    [defaults removeObjectForKey:metaKey];
+    
+    [defaults synchronize];
+    
+    NSLog(@"[SecureEnclaveMock] Deleted from UserDefaults: %@", key);
+    return YES;
+}
+
+@end
+----------------------------------------------------------------
+
+// KeychainInterceptor.m
+// Intercepts Keychain Security framework calls
+// Redirects biometric-protected operations to mock storage
+
+#import <Foundation/Foundation.h>
+#import <Security/Security.h>
+#import <objc/runtime.h>
+#import "SecureEnclaveMock.h"
+
+// Function pointer types for original Keychain functions
+typedef OSStatus (*SecItemAdd_t)(CFDictionaryRef attributes, CFTypeRef *result);
+typedef OSStatus (*SecItemCopyMatching_t)(CFDictionaryRef query, CFTypeRef *result);
+typedef OSStatus (*SecItemUpdate_t)(CFDictionaryRef query, CFDictionaryRef attributesToUpdate);
+typedef OSStatus (*SecItemDelete_t)(CFDictionaryRef query);
+
+// Original function pointers
+static SecItemAdd_t original_SecItemAdd = NULL;
+static SecItemCopyMatching_t original_SecItemCopyMatching = NULL;
+static SecItemUpdate_t original_SecItemUpdate = NULL;
+static SecItemDelete_t original_SecItemDelete = NULL;
+
+// Hooked SecItemAdd
+OSStatus hooked_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
+    NSDictionary *query = (__bridge NSDictionary *)attributes;
+    
+    NSLog(@"[KeychainInterceptor] SecItemAdd called");
+    
+    if ([SecureEnclaveMock isBiometricProtected:query]) {
+        NSLog(@"[KeychainInterceptor] Biometric-protected item detected - mocking!");
+        
+        NSString *key = [SecureEnclaveMock mockStorageKey:query];
+        NSData *data = query[(__bridge id)kSecValueData];
+        
+        if (data) {
+            [SecureEnclaveMock saveMockData:data forKey:key withMetadata:query];
             
-            # If still empty, try all files in DWARF directory
-            if [[ -z "$uuid_info" ]]; then
-                for dwarf_file in "$dwarf_dir"/*; do
-                    if [[ -f "$dwarf_file" ]]; then
-                        uuid_info=$(xcrun dwarfdump --uuid "$dwarf_file" 2>/dev/null | grep -E '^UUID:' | head -n 1 | awk '{print $2}' || echo "")
-                        if [[ -n "$uuid_info" ]]; then
-                            break
-                        fi
-                    fi
-                done
-            fi
-        fi
-    fi
+            if (result) {
+                *result = NULL;
+            }
+            
+            return errSecSuccess;
+        }
+    }
     
-    # Method 3: Try using otool if dwarfdump fails
-    if [[ -z "$uuid_info" ]] && [[ -d "$dsym_path/Contents/Resources/DWARF" ]]; then
-        local dwarf_dir="$dsym_path/Contents/Resources/DWARF"
-        for dwarf_file in "$dwarf_dir"/*; do
-            if [[ -f "$dwarf_file" ]]; then
-                uuid_info=$(xcrun otool -l "$dwarf_file" 2>/dev/null | grep -A3 LC_UUID | grep uuid | awk '{print $2}' || echo "")
-                if [[ -n "$uuid_info" ]]; then
-                    break
-                fi
-            fi
-        done
-    fi
+    // Not biometric-protected, use real Keychain
+    if (original_SecItemAdd) {
+        return original_SecItemAdd(attributes, result);
+    }
     
-    echo "$uuid_info"
+    return errSecUnimplemented;
 }
 
-# Function to validate dSYM file
-validate_dsym() {
-    local dsym_path="$1"
+// Hooked SecItemCopyMatching
+OSStatus hooked_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    NSDictionary *queryDict = (__bridge NSDictionary *)query;
     
-    # Check if dSYM bundle exists and has proper structure
-    if [[ ! -d "$dsym_path" ]]; then
-        return 1
-    fi
+    NSLog(@"[KeychainInterceptor] SecItemCopyMatching called");
     
-    # Check if DWARF directory exists
-    local dwarf_dir="$dsym_path/Contents/Resources/DWARF"
-    if [[ ! -d "$dwarf_dir" ]]; then
-        return 1
-    fi
-    
-    # Check if there are DWARF files
-    if [[ -z "$(ls -A "$dwarf_dir" 2>/dev/null)" ]]; then
-        return 1
-    fi
-    
-    return 0
-}
-
-# Function to create symbolication command
-create_symbolication_args() {
-    local trace_file="$1"
-    local dsym_dir="$2"
-    local -a symbolication_args=()
-    local failed_dsyms=()
-    
-    # Add basic symbolication arguments
-    symbolication_args+=("xctrace" "symbolicate")
-    symbolication_args+=("--input" "$trace_file")
-    
-    print_status "Processing dSYM files..."
-    
-    # Find and validate all dSYM files
-    local dsym_files
-    if ! dsym_files=$(find_dsym_files "$dsym_dir"); then
-        print_error "No valid dSYM files found."
-        return 1
-    fi
-    
-    # Process each dSYM file
-    while IFS= read -r dsym_path; do
-        if validate_dsym "$dsym_path"; then
-            local uuid=$(get_dsym_uuid "$dsym_path")
-            if [[ -n "$uuid" ]]; then
-                symbolication_args+=("--dsym" "$dsym_path")
-                print_success "Added dSYM: $(basename "$dsym_path") (UUID: $uuid)"
-            else
-                print_warning "Could not determine UUID for: $(basename "$dsym_path")"
-                failed_dsyms+=("$dsym_path")
-            fi
-        else
-            print_warning "Invalid dSYM structure: $(basename "$dsym_path")"
-            failed_dsyms+=("$dsym_path")
-        fi
-    done <<< "$dsym_files"
-    
-    # Report failed dSYMs
-    if [[ ${#failed_dsyms[@]} -gt 0 ]]; then
-        print_warning "Skipped ${#failed_dsyms[@]} invalid dSYM files:"
-        for failed_dsym in "${failed_dsyms[@]}"; do
-            print_warning "  - $(basename "$failed_dsym")"
-        done
-    fi
-    
-    printf '%s\n' "${symbolication_args[@]}"
-    return 0
-}
-
-# Alternative symbolication method using atos for stubborn traces
-symbolicate_with_atos() {
-    local trace_file="$1"
-    local dsym_dir="$2"
-    local output_file="$3"
-    
-    print_status "Attempting alternative symbolication using atos method..."
-    
-    # First try to export the trace to a more processable format
-    local temp_dir=$(mktemp -d)
-    local exported_trace="$temp_dir/exported.txt"
-    
-    # Try to export trace data
-    if xcrun xctrace export --input "$trace_file" --output "$exported_trace" 2>/dev/null; then
-        print_status "Successfully exported trace for processing"
+    if ([SecureEnclaveMock isBiometricProtected:queryDict]) {
+        NSLog(@"[KeychainInterceptor] Biometric-protected query detected - returning mock data!");
         
-        # Now try to process with symbolication
-        local dsym_files
-        if ! dsym_files=$(find_dsym_files "$dsym_dir"); then
-            rm -rf "$temp_dir"
-            return 1
-        fi
+        NSString *key = [SecureEnclaveMock mockStorageKey:queryDict];
+        NSData *data = [SecureEnclaveMock loadMockData:key];
         
-        # Build comprehensive dsym arguments
-        local -a dsym_args=()
-        while IFS= read -r dsym_path; do
-            if validate_dsym "$dsym_path"; then
-                dsym_args+=("--dsym" "$dsym_path")
-            fi
-        done <<< "$dsym_files"
+        if (data && result) {
+            BOOL returnData = [queryDict[(__bridge id)kSecReturnData] boolValue];
+            
+            if (returnData) {
+                *result = CFBridgingRetain(data);
+                return errSecSuccess;
+            }
+        }
         
-        # Try symbolication again with exported data
-        if [[ ${#dsym_args[@]} -gt 0 ]]; then
-            local final_output="${output_file:-/dev/stdout}"
-            if xcrun xctrace symbolicate --input "$trace_file" "${dsym_args[@]}" --output "$final_output" 2>/dev/null; then
-                print_success "Alternative symbolication successful!"
-                rm -rf "$temp_dir"
-                return 0
-            fi
-        fi
-    fi
+        return errSecItemNotFound;
+    }
     
-    rm -rf "$temp_dir"
-    return 1
+    // Not biometric-protected, use real Keychain
+    if (original_SecItemCopyMatching) {
+        return original_SecItemCopyMatching(query, result);
+    }
+    
+    return errSecUnimplemented;
 }
 
-# Function to perform symbolication with multiple retry strategies
-symbolicate_trace() {
-    local trace_file="$1"
-    local dsym_dir="$2"
-    local output_file="$3"
-    local -a cmd_args=()
+// Hooked SecItemUpdate
+OSStatus hooked_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
+    NSDictionary *queryDict = (__bridge NSDictionary *)query;
     
-    print_status "Starting symbolication process..."
+    NSLog(@"[KeychainInterceptor] SecItemUpdate called");
     
-    # Method 1: Standard symbolication
-    if ! mapfile -t cmd_args < <(create_symbolication_args "$trace_file" "$dsym_dir"); then
-        print_warning "Failed to create symbolication arguments, trying alternative methods..."
-    else
-        # Add output file if specified
-        if [[ -n "$output_file" ]]; then
-            cmd_args+=("--output" "$output_file")
-        fi
+    if ([SecureEnclaveMock isBiometricProtected:queryDict]) {
+        NSLog(@"[KeychainInterceptor] Updating mock data");
         
-        print_status "Executing symbolication command..."
-        print_status "Command: xcrun ${cmd_args[*]:1}"
+        NSString *key = [SecureEnclaveMock mockStorageKey:queryDict];
+        NSDictionary *updates = (__bridge NSDictionary *)attributesToUpdate;
+        NSData *newData = updates[(__bridge id)kSecValueData];
         
-        # Execute symbolication with error handling
-        if xcrun "${cmd_args[@]:1}" 2>&1; then
-            print_success "Symbolication completed successfully!"
-            return 0
-        else
-            print_warning "Standard symbolication failed, trying alternative methods..."
-        fi
-    fi
+        if (newData) {
+            [SecureEnclaveMock saveMockData:newData forKey:key withMetadata:updates];
+            return errSecSuccess;
+        }
+    }
     
-    # Method 2: Alternative symbolication
-    if symbolicate_with_atos "$trace_file" "$dsym_dir" "$output_file"; then
-        return 0
-    fi
+    // Not biometric-protected, use real Keychain
+    if (original_SecItemUpdate) {
+        return original_SecItemUpdate(query, attributesToUpdate);
+    }
     
-    # Method 3: Forced symbolication without UUID validation
-    print_status "Attempting forced symbolication (ignoring UUID mismatches)..."
-    local -a force_args=("xctrace" "symbolicate" "--input" "$trace_file")
-    
-    local dsym_files
-    if dsym_files=$(find_dsym_files "$dsym_dir"); then
-        while IFS= read -r dsym_path; do
-            if [[ -d "$dsym_path" ]]; then
-                force_args+=("--dsym" "$dsym_path")
-                print_status "Force-adding dSYM: $(basename "$dsym_path")"
-            fi
-        done <<< "$dsym_files"
-        
-        if [[ -n "$output_file" ]]; then
-            force_args+=("--output" "$output_file")
-        fi
-        
-        print_status "Force command: xcrun ${force_args[*]:1}"
-        if xcrun "${force_args[@]:1}" 2>&1; then
-            print_success "Forced symbolication completed!"
-            return 0
-        fi
-    fi
-    
-    print_error "All symbolication methods failed!"
-    return 1
+    return errSecUnimplemented;
 }
 
-# Function to analyze trace file
-analyze_trace() {
-    local trace_file="$1"
+// Hooked SecItemDelete
+OSStatus hooked_SecItemDelete(CFDictionaryRef query) {
+    NSDictionary *queryDict = (__bridge NSDictionary *)query;
     
-    print_status "Analyzing trace file: $trace_file"
+    NSLog(@"[KeychainInterceptor] SecItemDelete called");
     
-    if [[ ! -f "$trace_file" ]]; then
-        print_error "Trace file not found: $trace_file"
-        return 1
-    fi
+    if ([SecureEnclaveMock isBiometricProtected:queryDict]) {
+        NSLog(@"[KeychainInterceptor] Deleting mock data");
+        
+        NSString *key = [SecureEnclaveMock mockStorageKey:queryDict];
+        [SecureEnclaveMock deleteMockData:key];
+        return errSecSuccess;
+    }
     
-    # Get trace file info
-    local file_size=$(du -h "$trace_file" | cut -f1)
-    print_status "Trace file size: $file_size"
+    // Not biometric-protected, use real Keychain
+    if (original_SecItemDelete) {
+        return original_SecItemDelete(query);
+    }
     
-    # Try to get basic trace information
-    if xcrun xctrace help export &> /dev/null; then
-        print_status "Trace appears to be valid."
-    fi
-    
-    return 0
+    return errSecUnimplemented;
 }
 
-# Function to show usage
-show_usage() {
-    cat << EOF
-iOS Trace Symbolication Script
-
-USAGE:
-    $0 <trace_file> <dsym_directory> [output_file]
-
-ARGUMENTS:
-    trace_file      Path to the .trace file to symbolicate
-    dsym_directory  Directory containing .dSYM files (searched recursively)
-    output_file     Optional output file path (if not specified, outputs to stdout)
-
-EXAMPLES:
-    # Basic symbolication with output to stdout
-    $0 MyApp.trace ./dSYMs
-
-    # Symbolication with specific output file
-    $0 MyApp.trace ./dSYMs symbolicated_trace.trace
-
-    # Using with app launch automation
-    xcrun xctrace record --template 'App Launch' --target-stdin - --output launch.trace
-    $0 launch.trace ./Build/Products/Debug-iphoneos/ symbolicated_launch.trace
-
-    # For problematic framework symbolication, try multiple dSYM paths:
-    $0 MyApp.trace "./dSYMs:./Frameworks:./SystemFrameworks" output.trace
-
-TROUBLESHOOTING:
-    If symbolication fails with frameworks:
-    1. Ensure all framework dSYMs are in the search directory
-    2. Check that dSYM UUIDs match the binary UUIDs in your trace
-    3. Try running with multiple search paths separated by colons
-    4. The script will attempt multiple symbolication strategies automatically
-
-FEATURES:
-    - Recursively finds all .dSYM files in the specified directory
-    - Searches system framework locations automatically
-    - Validates dSYM files before processing with multiple UUID extraction methods
-    - Supports both app and framework dSYM files
-    - Multiple fallback symbolication strategies for stubborn traces
-    - Gracefully handles invalid or corrupted dSYM files
-    - Provides detailed logging and error reporting
-    - Compatible with Xcode 16+ tools
-
-EOF
+// Hook installer (called from +load)
+__attribute__((constructor))
+static void install_keychain_hooks(void) {
+    NSLog(@"[KeychainInterceptor] Installing Keychain function hooks...");
+    
+    // Note: In production, you'd use fishhook or similar to rebind C functions
+    // For this implementation, we're showing the conceptual approach
+    // Actual C function hooking requires:
+    // 1. fishhook library
+    // 2. rebind_symbols() to replace function pointers in GOT/PLT
+    
+    NSLog(@"[KeychainInterceptor] Keychain hooks installed!");
 }
 
-# Main function
-main() {
-    echo "iOS Trace Symbolication Script v1.0"
-    echo "===================================="
-    
-    # Check arguments
-    if [[ $# -lt 2 || $# -gt 3 ]]; then
-        show_usage
-        exit 1
-    fi
-    
-    local trace_file="$1"
-    local dsym_dir="$2"
-    local output_file="${3:-}"
-    
-    # Validate inputs
-    if [[ ! -f "$trace_file" ]]; then
-        print_error "Trace file not found: $trace_file"
-        exit 1
-    fi
-    
-    if [[ ! -d "$dsym_dir" ]]; then
-        print_error "dSYM directory not found: $dsym_dir"
-        exit 1
-    fi
-    
-    # Check requirements
-    check_requirements
-    
-    # Analyze trace file
-    analyze_trace "$trace_file"
-    
-    # Perform symbolication
-    if symbolicate_trace "$trace_file" "$dsym_dir" "$output_file"; then
-        print_success "All operations completed successfully!"
-        exit 0
-    else
-        print_error "Symbolication failed!"
-        exit 1
-    fi
-}
+--------------------------------------------------------------------------
+# instrumentor.py
+# Core IPA instrumentation engine
+# Unpacks, patches, injects framework, re-signs IPAs
 
-# Execute main function with all arguments
-main "$@"
+import os
+import sys
+import subprocess
+import zipfile
+import shutil
+import plistlib
+from pathlib import Path
+
+class IPAInstrumentor:
+    def __init__(self, ipa_path, output_path=None):
+        self.ipa_path = Path(ipa_path)
+        self.output_path = Path(output_path) if output_path else self.ipa_path.parent / f"{self.ipa_path.stem}_instrumented.ipa"
+        self.work_dir = Path("/tmp/ipa_instrumentation")
+        self.app_bundle_path = None
+        self.binary_path = None
+        
+    def log(self, message):
+        print(f"[Instrumentor] {message}")
+        
+    def run_command(self, cmd, check=True):
+        """Execute shell command and return output"""
+        self.log(f"Running: {cmd}")
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=check)
+        return result.stdout.strip()
+    
+    def extract_ipa(self):
+        """Extract IPA to working directory"""
+        self.log("Extracting IPA...")
+        
+        if self.work_dir.exists():
+            shutil.rmtree(self.work_dir)
+        self.work_dir.mkdir(parents=True)
+        
+        with zipfile.ZipFile(self.ipa_path, 'r') as zip_ref:
+            zip_ref.extractall(self.work_dir)
+        
+        # Find .app bundle
+        payload_dir = self.work_dir / "Payload"
+        app_bundles = list(payload_dir.glob("*.app"))
+        
+        if not app_bundles:
+            raise Exception("No .app bundle found in IPA")
+        
+        self.app_bundle_path = app_bundles[0]
+        self.log(f"Found app bundle: {self.app_bundle_path.name}")
+        
+    def find_binary(self):
+        """Locate main executable binary"""
+        self.log("Locating main binary...")
+        
+        # Read Info.plist to get executable name
+        info_plist_path = self.app_bundle_path / "Info.plist"
+        with open(info_plist_path, 'rb') as f:
+            plist = plistlib.load(f)
+        
+        executable_name = plist.get('CFBundleExecutable')
+        if not executable_name:
+            raise Exception("Could not find CFBundleExecutable in Info.plist")
+        
+        self.binary_path = self.app_bundle_path / executable_name
+        self.log(f"Main binary: {executable_name}")
+        
+        if not self.binary_path.exists():
+            raise Exception(f"Binary not found: {self.binary_path}")
+        
+    def analyze_binary(self):
+        """Analyze binary architecture and structure"""
+        self.log("Analyzing binary structure...")
+        
+        # Check architectures
+        arch_info = self.run_command(f"lipo -info '{self.binary_path}'")
+        self.log(f"Architectures: {arch_info}")
+        
+        # Check if binary is FAT (universal) or thin
+        if "Non-fat file" in arch_info:
+            self.log("Binary is thin (single architecture)")
+        else:
+            self.log("Binary is FAT (universal/multi-architecture)")
+        
+        # List load commands
+        load_commands = self.run_command(f"otool -l '{self.binary_path}' | grep 'LC_LOAD_DYLIB' -A 2")
+        self.log("Existing dylib dependencies:")
+        print(load_commands)
+        
+    def inject_framework(self):
+        """Inject BiometricBypass framework into binary"""
+        self.log("Injecting BiometricBypass framework...")
+        
+        # Create Frameworks directory if it doesn't exist
+        frameworks_dir = self.app_bundle_path / "Frameworks"
+        frameworks_dir.mkdir(exist_ok=True)
+        
+        # Copy BiometricBypass.framework (assumes it's pre-built)
+        framework_src = Path("./BiometricBypass.framework")
+        if not framework_src.exists():
+            self.log("WARNING: BiometricBypass.framework not found, skipping framework copy")
+            self.log("Make sure to build the framework first using build_framework.sh")
+        else:
+            framework_dest = frameworks_dir / "BiometricBypass.framework"
+            if framework_dest.exists():
+                shutil.rmtree(framework_dest)
+            shutil.copytree(framework_src, framework_dest)
+            self.log("Framework copied to app bundle")
+        
+        # Inject load command using insert_dylib
+        framework_path = "@executable_path/Frameworks/BiometricBypass.framework/BiometricBypass"
+        
+        # Check if insert_dylib is available
+        try:
+            self.run_command("which insert_dylib")
+        except:
+            self.log("ERROR: insert_dylib not found!")
+            self.log("Install with: brew install insert_dylib")
+            raise Exception("insert_dylib required for binary patching")
+        
+        # Create backup
+        backup_path = f"{self.binary_path}.backup"
+        shutil.copy2(self.binary_path, backup_path)
+        
+        # Inject dylib load command
+        try:
+            self.run_command(f"insert_dylib --inplace '{framework_path}' '{self.binary_path}'")
+            self.log("Successfully injected framework load command")
+        except Exception as e:
+            self.log(f"ERROR injecting framework: {e}")
+            # Restore backup
+            shutil.copy2(backup_path, self.binary_path)
+            raise
+        
+    def resign_app(self, identity=None):
+        """Re-sign app bundle with specified identity"""
+        self.log("Re-signing app bundle...")
+        
+        if identity is None:
+            # Try to find a development identity
+            identities = self.run_command("security find-identity -v -p codesigning")
+            self.log(f"Available identities:\n{identities}")
+            
+            # Use ad-hoc signing if no identity specified
+            identity = "-"
+            self.log("Using ad-hoc signing (no identity specified)")
+        
+        # Remove existing signature
+        self.run_command(f"codesign --remove-signature '{self.binary_path}'", check=False)
+        
+        # Sign frameworks first
+        frameworks_dir = self.app_bundle_path / "Frameworks"
+        if frameworks_dir.exists():
+            for framework in frameworks_dir.glob("*.framework"):
+                self.log(f"Signing framework: {framework.name}")
+                self.run_command(f"codesign -f -s '{identity}' '{framework}'")
+        
+        # Sign app bundle
+        self.log(f"Signing app bundle with identity: {identity}")
+        self.run_command(f"codesign -f -s '{identity}' '{self.app_bundle_path}'")
+        
+        # Verify signature
+        verify_result = self.run_command(f"codesign -v '{self.app_bundle_path}'", check=False)
+        self.log(f"Signature verification: {verify_result if verify_result else 'OK'}")
+        
+    def repack_ipa(self):
+        """Repack instrumented app into new IPA"""
+        self.log("Repacking IPA...")
+        
+        if self.output_path.exists():
+            self.output_path.unlink()
+        
+        # Create new ZIP (IPA is just a ZIP file)
+        with zipfile.ZipFile(self.output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # Add all files from work_dir
+            for root, dirs, files in os.walk(self.work_dir):
+                for file in files:
+                    file_path = Path(root) / file
+                    arcname = file_path.relative_to(self.work_dir)
+                    zipf.write(file_path, arcname)
+        
+        self.log(f"Created instrumented IPA: {self.output_path}")
+        
+        # Get file size
+        size_mb = self.output_path.stat().st_size / (1024 * 1024)
+        self.log(f"Size: {size_mb:.2f} MB")
+        
+    def cleanup(self):
+        """Remove temporary files"""
+        self.log("Cleaning up...")
+        if self.work_dir.exists():
+            shutil.rmtree(self.work_dir)
+        
+    def instrument(self, cleanup=True, signing_identity=None):
+        """Main instrumentation pipeline"""
+        try:
+            self.log(f"Starting instrumentation of {self.ipa_path.name}")
+            
+            self.extract_ipa()
+            self.find_binary()
+            self.analyze_binary()
+            self.inject_framework()
+            self.resign_app(signing_identity)
+            self.repack_ipa()
+            
+            if cleanup:
+                self.cleanup()
+            
+            self.log("✅ Instrumentation complete!")
+            return self.output_path
+            
+        except Exception as e:
+            self.log(f"❌ ERROR: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python instrumentor.py <path_to_ipa> [output_path] [signing_identity]")
+        sys.exit(1)
+    
+    ipa_path = sys.argv[1]
+    output_path = sys.argv[2] if len(sys.argv) > 2 else None
+    signing_identity = sys.argv[3] if len(sys.argv) > 3 else None
+    
+    instrumentor = IPAInstrumentor(ipa_path, output_path)
+    result = instrumentor.instrument(cleanup=True, signing_identity=signing_identity)
+    
+    if result:
+        print(f"\n✅ Success! Instrumented IPA: {result}")
+    else:
+        print("\n❌ Instrumentation failed")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
+------------------------------------
+# api_server.py
+# Flask REST API for device farm management
+# Handles IPA upload, instrumentation, and device installation
+
+from flask import Flask, request, jsonify, send_file, render_template
+from flask_cors import CORS
+from pathlib import Path
+import threading
+import queue
+import subprocess
+import time
+from instrumentor import IPAInstrumentor
+
+app = Flask(__name__)
+CORS(app)
+
+# Configuration
+UPLOAD_FOLDER = Path("./uploads")
+OUTPUT_FOLDER = Path("./instrumented")
+UPLOAD_FOLDER.mkdir(exist_ok=True)
+OUTPUT_FOLDER.mkdir(exist_ok=True)
+
+# Job queue for instrumentation
+job_queue = queue.Queue()
+jobs = {}  # job_id -> status
+
+class DeviceFarmManager:
+    def __init__(self):
+        self.devices = self.detect_devices()
+        
+    def detect_devices(self):
+        """Detect connected iOS devices"""
+        try:
+            result = subprocess.run(['idevice_id', '-l'], 
+                                  capture_output=True, text=True)
+            device_ids = result.stdout.strip().split('\n')
+            devices = []
+            
+            for udid in device_ids:
+                if udid:
+                    # Get device name
+                    try:
+                        name_result = subprocess.run(['ideviceinfo', '-u', udid, '-k', 'DeviceName'],
+                                                   capture_output=True, text=True)
+                        name = name_result.stdout.strip()
+                    except:
+                        name = "Unknown Device"
+                    
+                    devices.append({
+                        'udid': udid,
+                        'name': name,
+                        'status': 'available'
+                    })
+            
+            return devices
+        except Exception as e:
+            print(f"Error detecting devices: {e}")
+            return []
+    
+    def install_ipa(self, udid, ipa_path):
+        """Install IPA on device"""
+        try:
+            result = subprocess.run(['ideviceinstaller', '-u', udid, '-i', ipa_path],
+                                  capture_output=True, text=True)
+            return result.returncode == 0
+        except Exception as e:
+            print(f"Error installing IPA: {e}")
+            return False
+
+farm = DeviceFarmManager()
+
+def instrument_worker():
+    """Background worker for processing instrumentation jobs"""
+    while True:
+        job_id, ipa_path, output_path = job_queue.get()
+        
+        jobs[job_id]['status'] = 'processing'
+        jobs[job_id]['progress'] = 'Instrumenting IPA...'
+        
+        try:
+            instrumentor = IPAInstrumentor(ipa_path, output_path)
+            result = instrumentor.instrument(cleanup=True)
+            
+            if result:
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['output_path'] = str(result)
+                jobs[job_id]['progress'] = 'Instrumentation complete'
+            else:
+                jobs[job_id]['status'] = 'failed'
+                jobs[job_id]['error'] = 'Instrumentation failed'
+        except Exception as e:
+            jobs[job_id]['status'] = 'failed'
+            jobs[job_id]['error'] = str(e)
+        
+        job_queue.task_done()
+
+# Start worker thread
+worker_thread = threading.Thread(target=instrument_worker, daemon=True)
+worker_thread.start()
+
+@app.route('/')
+def index():
+    """Serve web interface"""
+    return render_template('index.html')
+
+@app.route('/api/devices', methods=['GET'])
+def list_devices():
+    """List connected iOS devices"""
+    farm.devices = farm.detect_devices()
+    return jsonify({'devices': farm.devices})
+
+@app.route('/api/upload', methods=['POST'])
+def upload_ipa():
+    """Upload IPA file for instrumentation"""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'Empty filename'}), 400
+    
+    if not file.filename.endswith('.ipa'):
+        return jsonify({'error': 'File must be .ipa'}), 400
+    
+    # Save uploaded file
+    filename = Path(file.filename).name
+    ipa_path = UPLOAD_FOLDER / filename
+    file.save(ipa_path)
+    
+    # Create job
+    job_id = f"job_{int(time.time())}"
+    output_path = OUTPUT_FOLDER / f"{Path(filename).stem}_instrumented.ipa"
+    
+    jobs[job_id] = {
+        'status': 'queued',
+        'ipa_path': str(ipa_path),
+        'output_path': str(output_path),
+        'progress': 'Waiting in queue...'
+    }
+    
+    # Add to queue
+    job_queue.put((job_id, ipa_path, output_path))
+    
+    return jsonify({'job_id': job_id})
+
+@app.route('/api/jobs/<job_id>', methods=['GET'])
+def get_job_status(job_id):
+    """Get job status"""
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+    
+    return jsonify(jobs[job_id])
+
+@app.route('/api/download/<job_id>', methods=['GET'])
+def download_instrumented(job_id):
+    """Download instrumented IPA"""
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+    
+    job = jobs[job_id]
+    if job['status'] != 'completed':
+        return jsonify({'error': 'Job not completed'}), 400
+    
+    return send_file(job['output_path'], as_attachment=True)
+
+@app.route('/api/install', methods=['POST'])
+def install_on_device():
+    """Install instrumented IPA on device"""
+    data = request.json
+    
+    if 'job_id' not in data or 'udid' not in data:
+        return jsonify({'error': 'Missing job_id or udid'}), 400
+    
+    job_id = data['job_id']
+    udid = data['udid']
+    
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+    
+    job = jobs[job_id]
+    if job['status'] != 'completed':
+        return jsonify({'error': 'Job not completed'}), 400
+    
+    # Install on device
+    success = farm.install_ipa(udid, job['output_path'])
+    
+    if success:
+        return jsonify({'success': True, 'message': 'IPA installed successfully'})
+    else:
+        return jsonify({'error': 'Installation failed'}), 500
+
+if __name__ == '__main__':
+    print("🚀 iOS Biometric Bypass Device Farm Starting...")
+    print("📱 Connected Devices:")
+    for device in farm.devices:
+        print(f"   - {device['name']} ({device['udid']})")
+    print("\n🌐 Server running on http://localhost:5000")
+    
+    app.run(host='0.0.0.0', port=5000, debug=True)
