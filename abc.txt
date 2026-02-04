@@ -1,110 +1,53 @@
 #!/bin/bash
 
-# Biometric Bypass Build Script
-set -e
+# Simple injection script for IPA
+INPUT_IPA="$1"
+OUTPUT_IPA="$2"
 
-echo "Building BiometricBypass framework..."
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <input.ipa> <output.ipa>"
+    exit 1
+fi
 
-# Create framework directory
-FRAMEWORK_NAME="BiometricBypass"
-FRAMEWORK_DIR="${FRAMEWORK_NAME}.framework"
-mkdir -p "${FRAMEWORK_DIR}/Headers"
+# Create temporary directory
+TEMP_DIR="/tmp/ipa_inject_$$"
+mkdir -p "$TEMP_DIR"
 
-# Compile source files
-echo "Compiling sources..."
-clang -c \
-    -arch arm64 -arch arm64e \
-    -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-    -miphoneos-version-min=11.0 \
-    -fmodules \
-    -fobjc-arc \
-    -I./ \
-    BiometricBypass.m \
-    SecureEnclaveMock.m \
-    fishhook.c \
-    KeychainHooks.c
+# Extract IPA
+echo "Extracting IPA..."
+unzip -q "$INPUT_IPA" -d "$TEMP_DIR"
 
-# Link into dynamic library
-echo "Creating dynamic library..."
-clang -dynamiclib \
-    -arch arm64 -arch arm64e \
-    -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-    -miphoneos-version-min=11.0 \
-    -install_name "@rpath/${FRAMEWORK_NAME}.framework/${FRAMEWORK_NAME}" \
-    -compatibility_version 1 \
-    -current_version 1 \
-    -fobjc-arc \
-    -framework Foundation \
-    -framework Security \
-    -framework LocalAuthentication \
-    -o "${FRAMEWORK_DIR}/${FRAMEWORK_NAME}" \
-    BiometricBypass.o \
-    SecureEnclaveMock.o \
-    fishhook.o \
-    KeychainHooks.o
+# Find .app directory
+APP_DIR=$(find "$TEMP_DIR" -name "*.app" -type d | head -1)
+if [ -z "$APP_DIR" ]; then
+    echo "Error: No .app found"
+    exit 1
+fi
 
-# Copy headers
-echo "Copying headers..."
-cp BiometricBypass.h "${FRAMEWORK_DIR}/Headers/"
-cp SecureEnclaveMock.h "${FRAMEWORK_DIR}/Headers/"
-cp fishhook.h "${FRAMEWORK_DIR}/Headers/"
-cp KeychainHooks.h "${FRAMEWORK_DIR}/Headers/"
+APP_NAME=$(basename "$APP_DIR" .app)
+EXECUTABLE="$APP_DIR/$APP_NAME"
 
-# Create umbrella header
-cat > "${FRAMEWORK_DIR}/Headers/${FRAMEWORK_NAME}.h" << EOF
-// BiometricBypass Framework
-// Auto-injects biometric and keychain bypass
+# Copy framework
+echo "Injecting framework..."
+mkdir -p "$APP_DIR/Frameworks"
+cp -r "BiometricBypass.framework" "$APP_DIR/Frameworks/"
 
-#import <Foundation/Foundation.h>
-#import "BiometricBypass.h"
-#import "SecureEnclaveMock.h"
-#import "fishhook.h"
-#import "KeychainHooks.h"
-EOF
+# Use optool to inject
+echo "Injecting load command..."
+# Download optool if not exists
+if [ ! -f "optool" ]; then
+    echo "Downloading optool..."
+    curl -L https://github.com/alexzielenski/optool/releases/download/0.1/optool.zip -o optool.zip
+    unzip optool.zip
+    chmod +x optool
+fi
 
-# Create Info.plist
-cat > "${FRAMEWORK_DIR}/Info.plist" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleDevelopmentRegion</key>
-    <string>en</string>
-    <key>CFBundleExecutable</key>
-    <string>${FRAMEWORK_NAME}</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.biometricbypass.${FRAMEWORK_NAME}</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
-    <string>${FRAMEWORK_NAME}</string>
-    <key>CFBundlePackageType</key>
-    <string>FMWK</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>MinimumOSVersion</key>
-    <string>11.0</string>
-</dict>
-</plist>
-EOF
+./optool install -c load -p "@executable_path/Frameworks/BiometricBypass.framework/BiometricBypass" -t "$EXECUTABLE"
 
-# Create modules directory
-mkdir -p "${FRAMEWORK_DIR}/Modules"
-cat > "${FRAMEWORK_DIR}/Modules/module.modulemap" << EOF
-framework module ${FRAMEWORK_NAME} {
-    umbrella header "${FRAMEWORK_NAME}.h"
-    
-    export *
-    module * { export * }
-}
-EOF
+# Package back to IPA
+echo "Creating IPA..."
+cd "$TEMP_DIR"
+zip -qr "$OUTPUT_IPA" Payload/
 
-echo "Framework created: ${FRAMEWORK_DIR}"
-echo "To verify: lipo -info ${FRAMEWORK_DIR}/${FRAMEWORK_NAME}"
-
-# Clean up object files
-rm -f *.o
-
-echo "Build complete!"
+echo "Injected IPA created: $OUTPUT_IPA"
+echo "Note: You need to resign this IPA before installing!"
