@@ -1,28 +1,249 @@
-#import <Foundation/Foundation.h>
-#import <Security/Security.h>
+#import "SecureEnclaveMock.h"
 
-NS_ASSUME_NONNULL_BEGIN
-
-@interface SecureEnclaveMock : NSObject
-
-@property (nonatomic, assign) BOOL simulateSuccess;
-
-+ (instancetype)shared;
-
-// Item management
-- (void)addItem:(NSDictionary *)attributes withIdentifier:(NSString *)identifier;
-- (nullable id)copyMatching:(NSDictionary *)query;
-- (BOOL)updateItemWithQuery:(NSDictionary *)query attributes:(NSDictionary *)attributes;
-- (BOOL)deleteItemWithQuery:(NSDictionary *)query;
-
-// Mock management
-- (void)mockItem:(NSDictionary *)item forQuery:(NSDictionary *)query;
-- (void)clearAllItems;
-
-// Query helpers
-- (NSArray *)findItemsMatchingQuery:(NSDictionary *)query;
-- (BOOL)item:(NSDictionary *)item matchesQuery:(NSDictionary *)query;
-
+@interface SecureEnclaveMock ()
+@property (nonatomic, strong) NSMutableDictionary *storage; // identifier -> item
+@property (nonatomic, strong) NSMutableDictionary *mockResponses; // query hash -> response
+@property (nonatomic, strong) dispatch_queue_t storageQueue;
 @end
 
-NS_ASSUME_NONNULL_END
+@implementation SecureEnclaveMock
+
++ (instancetype)shared {
+    static SecureEnclaveMock *sharedInstance = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sharedInstance = [[self alloc] init];
+    });
+    return sharedInstance;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _storage = [NSMutableDictionary dictionary];
+        _mockResponses = [NSMutableDictionary dictionary];
+        _storageQueue = dispatch_queue_create("com.biometricbypass.storage", DISPATCH_QUEUE_SERIAL);
+        _simulateSuccess = YES; // Default to successful biometrics
+    }
+    return self;
+}
+
+#pragma mark - Item Management
+
+- (void)addItem:(NSDictionary *)attributes withIdentifier:(NSString *)identifier {
+    dispatch_sync(self.storageQueue, ^{
+        // Create a mutable copy to add metadata
+        NSMutableDictionary *item = [attributes mutableCopy];
+        item[@"_mock_identifier"] = identifier;
+        item[@"_mock_timestamp"] = @([[NSDate date] timeIntervalSince1970]);
+        
+        self.storage[identifier] = [item copy];
+        NSLog(@"[SecureEnclaveMock] Added item with identifier: %@", identifier);
+    });
+}
+
+- (nullable id)copyMatching:(NSDictionary *)query {
+    __block id result = nil;
+    
+    dispatch_sync(self.storageQueue, ^{
+        // First check mock responses
+        NSString *queryHash = [self hashForDictionary:query];
+        if (self.mockResponses[queryHash]) {
+            result = self.mockResponses[queryHash];
+            NSLog(@"[SecureEnclaveMock] Returning mocked response for query");
+            return;
+        }
+        
+        // Find matching items in storage
+        NSArray *matchingItems = [self findItemsMatchingQuery:query];
+        
+        if (matchingItems.count == 0) {
+            result = nil;
+            return;
+        }
+        
+        // Determine what to return based on query parameters
+        CFTypeRef returnData = (__bridge CFTypeRef)query[(__bridge id)kSecReturnData];
+        CFTypeRef returnAttributes = (__bridge CFTypeRef)query[(__bridge id)kSecReturnAttributes];
+        CFTypeRef returnRef = (__bridge CFTypeRef)query[(__bridge id)kSecReturnRef];
+        CFTypeRef returnPersistentRef = (__bridge CFTypeRef)query[(__bridge id)kSecReturnPersistentRef];
+        
+        BOOL returnDataBool = returnData && CFGetTypeID(returnData) == CFBooleanGetTypeID() && CFBooleanGetValue(returnData);
+        BOOL returnAttributesBool = returnAttributes && CFGetTypeID(returnAttributes) == CFBooleanGetTypeID() && CFBooleanGetValue(returnAttributes);
+        BOOL returnRefBool = returnRef && CFGetTypeID(returnRef) == CFBooleanGetTypeID() && CFBooleanGetValue(returnRef);
+        BOOL returnPersistentRefBool = returnPersistentRef && CFGetTypeID(returnPersistentRef) == CFBooleanGetTypeID() && CFBooleanGetValue(returnPersistentRef);
+        
+        NSDictionary *firstItem = matchingItems.firstObject;
+        
+        if (returnDataBool) {
+            // Return just the data
+            result = firstItem[(__bridge id)kSecValueData];
+        } else if (returnAttributesBool) {
+            // Return attributes (without mock metadata)
+            NSMutableDictionary *cleanAttributes = [firstItem mutableCopy];
+            [cleanAttributes removeObjectsForKeys:@[@"_mock_identifier", @"_mock_timestamp"]];
+            result = [cleanAttributes copy];
+        } else if (returnPersistentRefBool) {
+            // Return persistent reference (our identifier)
+            result = firstItem[@"_mock_identifier"];
+        } else if (returnRefBool) {
+            // For ref, we return a dummy SecKeyRef or similar
+            // Create a dummy CFTypeRef
+            static CFTypeRef dummyRef = NULL;
+            static dispatch_once_t onceToken;
+            dispatch_once(&onceToken, ^{
+                dummyRef = CFSTR("MOCK_SEC_KEY_REF");
+                CFRetain(dummyRef);
+            });
+            result = (__bridge id)dummyRef;
+        } else {
+            // Default: return attributes
+            NSMutableDictionary *cleanAttributes = [firstItem mutableCopy];
+            [cleanAttributes removeObjectsForKeys:@[@"_mock_identifier", @"_mock_timestamp"]];
+            result = [cleanAttributes copy];
+        }
+    });
+    
+    return result;
+}
+
+- (BOOL)updateItemWithQuery:(NSDictionary *)query attributes:(NSDictionary *)attributes {
+    __block BOOL updated = NO;
+    
+    dispatch_sync(self.storageQueue, ^{
+        NSArray *matchingItems = [self findItemsMatchingQuery:query];
+        
+        for (NSDictionary *item in matchingItems) {
+            NSString *identifier = item[@"_mock_identifier"];
+            if (identifier) {
+                // Merge attributes
+                NSMutableDictionary *updatedItem = [item mutableCopy];
+                [updatedItem addEntriesFromDictionary:attributes];
+                updatedItem[@"_mock_timestamp"] = @([[NSDate date] timeIntervalSince1970]);
+                
+                self.storage[identifier] = [updatedItem copy];
+                updated = YES;
+                NSLog(@"[SecureEnclaveMock] Updated item: %@", identifier);
+            }
+        }
+    });
+    
+    return updated;
+}
+
+- (BOOL)deleteItemWithQuery:(NSDictionary *)query {
+    __block BOOL deleted = NO;
+    
+    dispatch_sync(self.storageQueue, ^{
+        NSArray *matchingItems = [self findItemsMatchingQuery:query];
+        
+        for (NSDictionary *item in matchingItems) {
+            NSString *identifier = item[@"_mock_identifier"];
+            if (identifier) {
+                [self.storage removeObjectForKey:identifier];
+                deleted = YES;
+                NSLog(@"[SecureEnclaveMock] Deleted item: %@", identifier);
+            }
+        }
+    });
+    
+    return deleted;
+}
+
+#pragma mark - Mock Management
+
+- (void)mockItem:(NSDictionary *)item forQuery:(NSDictionary *)query {
+    dispatch_sync(self.storageQueue, ^{
+        NSString *queryHash = [self hashForDictionary:query];
+        self.mockResponses[queryHash] = item;
+        NSLog(@"[SecureEnclaveMock] Added mock response for query hash: %@", queryHash);
+    });
+}
+
+- (void)clearAllItems {
+    dispatch_sync(self.storageQueue, ^{
+        [self.storage removeAllObjects];
+        [self.mockResponses removeAllObjects];
+        NSLog(@"[SecureEnclaveMock] Cleared all mocked items");
+    });
+}
+
+#pragma mark - Query Helpers
+
+- (NSArray *)findItemsMatchingQuery:(NSDictionary *)query {
+    NSMutableArray *matches = [NSMutableArray array];
+    
+    for (NSDictionary *item in self.storage.allValues) {
+        if ([self item:item matchesQuery:query]) {
+            [matches addObject:item];
+        }
+    }
+    
+    return [matches copy];
+}
+
+- (BOOL)item:(NSDictionary *)item matchesQuery:(NSDictionary *)query {
+    // Check kSecClass
+    id queryClass = query[(__bridge id)kSecClass];
+    id itemClass = item[(__bridge id)kSecClass];
+    
+    if (queryClass && itemClass && ![queryClass isEqual:itemClass]) {
+        return NO;
+    }
+    
+    // Check kSecAttrAccount
+    id queryAccount = query[(__bridge id)kSecAttrAccount];
+    id itemAccount = item[(__bridge id)kSecAttrAccount];
+    
+    if (queryAccount && itemAccount && ![queryAccount isEqual:itemAccount]) {
+        return NO;
+    }
+    
+    // Check kSecAttrService
+    id queryService = query[(__bridge id)kSecAttrService];
+    id itemService = item[(__bridge id)kSecAttrService];
+    
+    if (queryService && itemService && ![queryService isEqual:itemService]) {
+        return NO;
+    }
+    
+    // Check kSecAttrGeneric
+    id queryGeneric = query[(__bridge id)kSecAttrGeneric];
+    id itemGeneric = item[(__bridge id)kSecAttrGeneric];
+    
+    if (queryGeneric && itemGeneric && ![queryGeneric isEqual:itemGeneric]) {
+        return NO;
+    }
+    
+    // Check kSecAttrAccessGroup
+    id queryAccessGroup = query[(__bridge id)kSecAttrAccessGroup];
+    id itemAccessGroup = item[(__bridge id)kSecAttrAccessGroup];
+    
+    if (queryAccessGroup && itemAccessGroup && ![queryAccessGroup isEqual:itemAccessGroup]) {
+        return NO;
+    }
+    
+    return YES;
+}
+
+- (NSString *)hashForDictionary:(NSDictionary *)dict {
+    NSError *error;
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:dict options:0 error:&error];
+    
+    if (error) {
+        return [NSString stringWithFormat:@"%lu", (unsigned long)[dict hash]];
+    }
+    
+    // Create SHA256 hash
+    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(jsonData.bytes, (CC_LONG)jsonData.length, hash);
+    
+    NSMutableString *hashString = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+        [hashString appendFormat:@"%02x", hash[i]];
+    }
+    
+    return [hashString copy];
+}
+
+@end
