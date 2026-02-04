@@ -1,27 +1,199 @@
-#ifndef fishhook_h
-#define fishhook_h
+#include "KeychainHooks.h"
+#include "fishhook.h"
+#include "SecureEnclaveMock.h"
+#include <Security/Security.h>
+#include <dlfcn.h>
+#include <stdio.h>
+#include <objc/runtime.h>
 
-#include <stddef.h>
-#include <stdint.h>
+// Original function pointers
+static OSStatus (*original_SecItemAdd)(CFDictionaryRef attributes, CFTypeRef *result);
+static OSStatus (*original_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result);
+static OSStatus (*original_SecItemUpdate)(CFDictionaryRef query, CFDictionaryRef attributesToUpdate);
+static OSStatus (*original_SecItemDelete)(CFDictionaryRef query);
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-struct rebinding {
-    const char *name;
-    void *replacement;
-    void **replaced;
-};
-
-int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel);
-int rebind_symbols_image(void *header,
-                         intptr_t slide,
-                         struct rebinding rebindings[],
-                         size_t rebindings_nel);
-
-#ifdef __cplusplus
+// Helper function to check if bypass is enabled
+BOOL bypass_enabled() {
+    Class bypassClass = objc_getClass("BiometricBypass");
+    if (bypassClass) {
+        SEL isEnabledSel = sel_registerName("isEnabled");
+        if ([bypassClass respondsToSelector:isEnabledSel]) {
+            BOOL (*isEnabledImp)(Class, SEL) = (BOOL (*)(Class, SEL))[bypassClass methodForSelector:isEnabledSel];
+            return isEnabledImp(bypassClass, isEnabledSel);
+        }
+    }
+    return NO;
 }
-#endif
 
-#endif /* fishhook_h */
+// Helper to check if item requires biometrics
+BOOL requires_biometrics(CFDictionaryRef dict) {
+    if (!dict) return NO;
+    
+    CFTypeRef protection = CFDictionaryGetValue(dict, kSecAttrAccessControl);
+    if (protection) {
+        return YES;
+    }
+    
+    CFTypeRef accessible = CFDictionaryGetValue(dict, kSecAttrAccessible);
+    if (accessible) {
+        CFStringRef accessibleStr = (CFStringRef)accessible;
+        // Check for biometric-protected accessibility classes
+        if (CFEqual(accessibleStr, kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly) ||
+            CFEqual(accessibleStr, kSecAttrAccessibleWhenUnlockedThisDeviceOnly) ||
+            CFEqual(accessibleStr, kSecAttrAccessibleWhenUnlocked)) {
+            return YES;
+        }
+    }
+    
+    return NO;
+}
+
+#pragma mark - Hooked Functions
+
+OSStatus hooked_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
+    if (!bypass_enabled()) {
+        return original_SecItemAdd(attributes, result);
+    }
+    
+    // Check if this item requires biometric protection
+    if (requires_biometrics(attributes)) {
+        NSLog(@"[BiometricBypass] Intercepted biometric-protected SecItemAdd");
+        
+        // Store in mock secure enclave
+        SecureEnclaveMock *mock = [SecureEnclaveMock shared];
+        NSDictionary *attributesDict = (__bridge NSDictionary *)attributes;
+        
+        // Generate a persistent reference if needed
+        if (result) {
+            NSString *uuid = [[NSUUID UUID] UUIDString];
+            CFStringRef persistentRef = (__bridge CFStringRef)uuid;
+            *result = persistentRef;
+            CFRetain(*result);
+            
+            // Store with the persistent reference as key
+            [mock addItem:attributesDict withIdentifier:uuid];
+            
+            NSLog(@"[BiometricBypass] Mocked SecItemAdd with persistent ref: %@", uuid);
+            return errSecSuccess;
+        } else {
+            // Store without reference
+            NSString *identifier = [NSString stringWithFormat:@"item_%lu", (unsigned long)[attributesDict hash]];
+            [mock addItem:attributesDict withIdentifier:identifier];
+            
+            NSLog(@"[BiometricBypass] Mocked SecItemAdd without result");
+            return errSecSuccess;
+        }
+    }
+    
+    // Pass through to original for non-biometric items
+    return original_SecItemAdd(attributes, result);
+}
+
+OSStatus hooked_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    if (!bypass_enabled()) {
+        return original_SecItemCopyMatching(query, result);
+    }
+    
+    // Check if this query is for biometric-protected items
+    if (requires_biometrics(query)) {
+        NSLog(@"[BiometricBypass] Intercepted biometric-protected SecItemCopyMatching");
+        
+        SecureEnclaveMock *mock = [SecureEnclaveMock shared];
+        NSDictionary *queryDict = (__bridge NSDictionary *)query;
+        
+        // Check for mocked items
+        id mockedResult = [mock copyMatching:queryDict];
+        if (mockedResult) {
+            if (result) {
+                *result = (__bridge_retained CFTypeRef)mockedResult;
+                NSLog(@"[BiometricBypass] Returning mocked SecItemCopyMatching result");
+                return errSecSuccess;
+            }
+        }
+        
+        // If no mock found and we're only querying, return not found
+        CFTypeRef returnType = CFDictionaryGetValue(query, kSecReturnRef);
+        if (returnType && CFBooleanGetValue(returnType) == false) {
+            // Just checking existence
+            NSLog(@"[BiometricBypass] Biometric item not found in mock");
+            return errSecItemNotFound;
+        }
+    }
+    
+    // Check for kSecClass
+    CFTypeRef secClass = CFDictionaryGetValue(query, kSecClass);
+    if (secClass) {
+        // Handle supported classes
+        if (CFEqual(secClass, kSecClassGenericPassword) || 
+            CFEqual(secClass, kSecClassInternetPassword)) {
+            // Try mock first
+            SecureEnclaveMock *mock = [SecureEnclaveMock shared];
+            NSDictionary *queryDict = (__bridge NSDictionary *)query;
+            id mockedResult = [mock copyMatching:queryDict];
+            
+            if (mockedResult) {
+                if (result) {
+                    *result = (__bridge_retained CFTypeRef)mockedResult;
+                    return errSecSuccess;
+                }
+            }
+        }
+    }
+    
+    // Fall back to original implementation
+    return original_SecItemCopyMatching(query, result);
+}
+
+OSStatus hooked_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
+    if (!bypass_enabled()) {
+        return original_SecItemUpdate(query, attributesToUpdate);
+    }
+    
+    if (requires_biometrics(query)) {
+        NSLog(@"[BiometricBypass] Intercepted biometric-protected SecItemUpdate");
+        
+        SecureEnclaveMock *mock = [SecureEnclaveMock shared];
+        NSDictionary *queryDict = (__bridge NSDictionary *)query;
+        NSDictionary *attributesDict = (__bridge NSDictionary *)attributesToUpdate;
+        
+        BOOL success = [mock updateItemWithQuery:queryDict attributes:attributesDict];
+        return success ? errSecSuccess : errSecItemNotFound;
+    }
+    
+    return original_SecItemUpdate(query, attributesToUpdate);
+}
+
+OSStatus hooked_SecItemDelete(CFDictionaryRef query) {
+    if (!bypass_enabled()) {
+        return original_SecItemDelete(query);
+    }
+    
+    if (requires_biometrics(query)) {
+        NSLog(@"[BiometricBypass] Intercepted biometric-protected SecItemDelete");
+        
+        SecureEnclaveMock *mock = [SecureEnclaveMock shared];
+        NSDictionary *queryDict = (__bridge NSDictionary *)query;
+        
+        BOOL success = [mock deleteItemWithQuery:queryDict];
+        return success ? errSecSuccess : errSecItemNotFound;
+    }
+    
+    return original_SecItemDelete(query);
+}
+
+#pragma mark - Hook Installation
+
+void install_keychain_hooks() {
+    NSLog(@"[BiometricBypass] Installing Keychain hooks...");
+    
+    struct rebinding rebindings[] = {
+        {"SecItemAdd", (void *)hooked_SecItemAdd, (void **)&original_SecItemAdd},
+        {"SecItemCopyMatching", (void *)hooked_SecItemCopyMatching, (void **)&original_SecItemCopyMatching},
+        {"SecItemUpdate", (void *)hooked_SecItemUpdate, (void **)&original_SecItemUpdate},
+        {"SecItemDelete", (void *)hooked_SecItemDelete, (void **)&original_SecItemDelete},
+    };
+    
+    rebind_symbols(rebindings, sizeof(rebindings) / sizeof(struct rebinding));
+    
+    NSLog(@"[BiometricBypass] Keychain hooks installed");
+}
