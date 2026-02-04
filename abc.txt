@@ -1,22 +1,77 @@
-#ifndef KeychainHooks_h
-#define KeychainHooks_h
+static BiometricBypass *_sharedInstance = nil;
 
-#include <stdio.h>
-#include <Security/Security.h>
-#import <Foundation/Foundation.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-// Function to install all keychain hooks
-void install_keychain_hooks(void);
-
-// Helper to check if bypass is enabled
-BOOL bypass_enabled(void);
-
-#ifdef __cplusplus
++ (void)load {
+    // This runs when the framework loads
+    NSLog(@"[BiometricBypass] Framework loading...");
+    
+    // Auto-start bypass
+    [self autoStart];
 }
-#endif
 
-#endif /* KeychainHooks_h */
++ (void)autoStart {
+    // Check environment variables for configuration
+    char *envEnabled = getenv("BIOMETRIC_BYPASS_ENABLED");
+    char *envOptions = getenv("BIOMETRIC_BYPASS_OPTIONS");
+    
+    BOOL shouldEnable = YES; // Enabled by default
+    BypassOptions options = BypassOptionAll; // All options by default
+    
+    if (envEnabled && strcmp(envEnabled, "0") == 0) {
+        shouldEnable = NO;
+    }
+    
+    if (envOptions) {
+        if (strcmp(envOptions, "biometrics") == 0) {
+            options = BypassOptionBiometrics;
+        } else if (strcmp(envOptions, "keychain") == 0) {
+            options = BypassOptionKeychain;
+        }
+    }
+    
+    // Start the bypass
+    [[self shared] setEnabled:shouldEnable];
+    [[self shared] setOptions:options];
+    [[self shared] installHooks];
+    
+    NSLog(@"[BiometricBypass] Auto-started with options: %lu, enabled: %d", 
+          (unsigned long)options, shouldEnable);
+}
+
++ (instancetype)shared {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        _sharedInstance = [[self alloc] init];
+    });
+    return _sharedInstance;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _enabled = YES;
+        _options = BypassOptionAll;
+        _secureEnclave = [SecureEnclaveMock shared];
+    }
+    return self;
+}
+
+- (void)installHooks {
+    if (!_enabled) {
+        NSLog(@"[BiometricBypass] Bypass disabled, skipping hooks");
+        return;
+    }
+    
+    NSLog(@"[BiometricBypass] Installing hooks...");
+    
+    // Install LAContext hooks (biometrics)
+    if (_options & BypassOptionBiometrics) {
+        [self swizzleLAContextMethods];
+    }
+    
+    // Install Keychain hooks
+    if (_options & BypassOptionKeychain) {
+        install_keychain_hooks();
+    }
+    
+    NSLog(@"[BiometricBypass] All hooks installed successfully");
+}
