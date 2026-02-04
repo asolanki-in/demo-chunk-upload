@@ -3,13 +3,17 @@
 
 #include <stdio.h>
 #include <Security/Security.h>
+#import <Foundation/Foundation.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Function to install the keychain hooks
+// Function to install all keychain hooks
 void install_keychain_hooks(void);
+
+// Helper to check if bypass is enabled
+BOOL bypass_enabled(void);
 
 #ifdef __cplusplus
 }
