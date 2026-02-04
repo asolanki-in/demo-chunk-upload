@@ -1,77 +1,110 @@
-static BiometricBypass *_sharedInstance = nil;
+#!/bin/bash
 
-+ (void)load {
-    // This runs when the framework loads
-    NSLog(@"[BiometricBypass] Framework loading...");
-    
-    // Auto-start bypass
-    [self autoStart];
-}
+# Biometric Bypass Build Script
+set -e
 
-+ (void)autoStart {
-    // Check environment variables for configuration
-    char *envEnabled = getenv("BIOMETRIC_BYPASS_ENABLED");
-    char *envOptions = getenv("BIOMETRIC_BYPASS_OPTIONS");
-    
-    BOOL shouldEnable = YES; // Enabled by default
-    BypassOptions options = BypassOptionAll; // All options by default
-    
-    if (envEnabled && strcmp(envEnabled, "0") == 0) {
-        shouldEnable = NO;
-    }
-    
-    if (envOptions) {
-        if (strcmp(envOptions, "biometrics") == 0) {
-            options = BypassOptionBiometrics;
-        } else if (strcmp(envOptions, "keychain") == 0) {
-            options = BypassOptionKeychain;
-        }
-    }
-    
-    // Start the bypass
-    [[self shared] setEnabled:shouldEnable];
-    [[self shared] setOptions:options];
-    [[self shared] installHooks];
-    
-    NSLog(@"[BiometricBypass] Auto-started with options: %lu, enabled: %d", 
-          (unsigned long)options, shouldEnable);
-}
+echo "Building BiometricBypass framework..."
 
-+ (instancetype)shared {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        _sharedInstance = [[self alloc] init];
-    });
-    return _sharedInstance;
-}
+# Create framework directory
+FRAMEWORK_NAME="BiometricBypass"
+FRAMEWORK_DIR="${FRAMEWORK_NAME}.framework"
+mkdir -p "${FRAMEWORK_DIR}/Headers"
 
-- (instancetype)init {
-    self = [super init];
-    if (self) {
-        _enabled = YES;
-        _options = BypassOptionAll;
-        _secureEnclave = [SecureEnclaveMock shared];
-    }
-    return self;
-}
+# Compile source files
+echo "Compiling sources..."
+clang -c \
+    -arch arm64 -arch arm64e \
+    -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+    -miphoneos-version-min=11.0 \
+    -fmodules \
+    -fobjc-arc \
+    -I./ \
+    BiometricBypass.m \
+    SecureEnclaveMock.m \
+    fishhook.c \
+    KeychainHooks.c
 
-- (void)installHooks {
-    if (!_enabled) {
-        NSLog(@"[BiometricBypass] Bypass disabled, skipping hooks");
-        return;
-    }
+# Link into dynamic library
+echo "Creating dynamic library..."
+clang -dynamiclib \
+    -arch arm64 -arch arm64e \
+    -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+    -miphoneos-version-min=11.0 \
+    -install_name "@rpath/${FRAMEWORK_NAME}.framework/${FRAMEWORK_NAME}" \
+    -compatibility_version 1 \
+    -current_version 1 \
+    -fobjc-arc \
+    -framework Foundation \
+    -framework Security \
+    -framework LocalAuthentication \
+    -o "${FRAMEWORK_DIR}/${FRAMEWORK_NAME}" \
+    BiometricBypass.o \
+    SecureEnclaveMock.o \
+    fishhook.o \
+    KeychainHooks.o
+
+# Copy headers
+echo "Copying headers..."
+cp BiometricBypass.h "${FRAMEWORK_DIR}/Headers/"
+cp SecureEnclaveMock.h "${FRAMEWORK_DIR}/Headers/"
+cp fishhook.h "${FRAMEWORK_DIR}/Headers/"
+cp KeychainHooks.h "${FRAMEWORK_DIR}/Headers/"
+
+# Create umbrella header
+cat > "${FRAMEWORK_DIR}/Headers/${FRAMEWORK_NAME}.h" << EOF
+// BiometricBypass Framework
+// Auto-injects biometric and keychain bypass
+
+#import <Foundation/Foundation.h>
+#import "BiometricBypass.h"
+#import "SecureEnclaveMock.h"
+#import "fishhook.h"
+#import "KeychainHooks.h"
+EOF
+
+# Create Info.plist
+cat > "${FRAMEWORK_DIR}/Info.plist" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>${FRAMEWORK_NAME}</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.biometricbypass.${FRAMEWORK_NAME}</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>${FRAMEWORK_NAME}</string>
+    <key>CFBundlePackageType</key>
+    <string>FMWK</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>MinimumOSVersion</key>
+    <string>11.0</string>
+</dict>
+</plist>
+EOF
+
+# Create modules directory
+mkdir -p "${FRAMEWORK_DIR}/Modules"
+cat > "${FRAMEWORK_DIR}/Modules/module.modulemap" << EOF
+framework module ${FRAMEWORK_NAME} {
+    umbrella header "${FRAMEWORK_NAME}.h"
     
-    NSLog(@"[BiometricBypass] Installing hooks...");
-    
-    // Install LAContext hooks (biometrics)
-    if (_options & BypassOptionBiometrics) {
-        [self swizzleLAContextMethods];
-    }
-    
-    // Install Keychain hooks
-    if (_options & BypassOptionKeychain) {
-        install_keychain_hooks();
-    }
-    
-    NSLog(@"[BiometricBypass] All hooks installed successfully");
+    export *
+    module * { export * }
 }
+EOF
+
+echo "Framework created: ${FRAMEWORK_DIR}"
+echo "To verify: lipo -info ${FRAMEWORK_DIR}/${FRAMEWORK_NAME}"
+
+# Clean up object files
+rm -f *.o
+
+echo "Build complete!"
