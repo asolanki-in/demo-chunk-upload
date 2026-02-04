@@ -1,44 +1,187 @@
-#import <Foundation/Foundation.h>
-#import <LocalAuthentication/LocalAuthentication.h>
-#import <Security/Security.h>
+#import "BiometricBypass.h"
+#import "SecureEnclaveMock.h"
+#import "KeychainHooks.h"
+#import <objc/runtime.h>
+#import <dlfcn.h>
 
-NS_ASSUME_NONNULL_BEGIN
+@implementation BiometricBypass {
+    BOOL _enabled;
+    BypassOptions _options;
+    SecureEnclaveMock *_secureEnclave;
+}
 
-// Configuration flags
-typedef NS_OPTIONS(NSUInteger, BypassOptions) {
-    BypassOptionNone = 0,
-    BypassOptionBiometrics = 1 << 0,
-    BypassOptionKeychain = 1 << 1,
-    BypassOptionAll = BypassOptionBiometrics | BypassOptionKeychain
-};
+static BiometricBypass *_sharedInstance = nil;
 
-@interface BiometricBypass : NSObject
++ (instancetype)shared {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        _sharedInstance = [[self alloc] init];
+    });
+    return _sharedInstance;
+}
 
-// Singleton instance
-+ (instancetype)shared;
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _enabled = YES;
+        _options = BypassOptionAll;
+        _secureEnclave = [SecureEnclaveMock shared];
+        
+        // Install hooks on initialization
+        [self installHooks];
+    }
+    return self;
+}
 
-// Configure bypass options
-+ (void)configureWithOptions:(BypassOptions)options;
++ (void)configureWithOptions:(BypassOptions)options {
+    [[self shared] setOptions:options];
+}
 
-// Enable/disable bypass at runtime
-+ (void)setEnabled:(BOOL)enabled;
++ (void)setEnabled:(BOOL)enabled {
+    [[self shared] setEnabled:enabled];
+}
 
-// Check if bypass is active
-+ (BOOL)isEnabled;
++ (BOOL)isEnabled {
+    return [[self shared] isEnabled];
+}
 
-// Simulate biometric authentication
-+ (BOOL)simulateBiometricSuccess:(BOOL)success;
++ (BOOL)simulateBiometricSuccess:(BOOL)success {
+    // Store simulation flag for LAContext hooks
+    [[SecureEnclaveMock shared] setSimulateSuccess:success];
+    return YES;
+}
 
-// Keychain mocking
-+ (void)mockKeychainItem:(NSDictionary *)item forQuery:(NSDictionary *)query;
-+ (void)clearMockedKeychain;
+- (void)setOptions:(BypassOptions)options {
+    _options = options;
+}
+
+- (void)setEnabled:(BOOL)enabled {
+    _enabled = enabled;
+}
+
+- (BOOL)isEnabled {
+    return _enabled;
+}
+
+#pragma mark - Method Swizzling
+
+- (void)installHooks {
+    if (!_enabled) return;
+    
+    // Only install hooks for selected options
+    if (_options & BypassOptionBiometrics) {
+        [self swizzleLAContextMethods];
+    }
+    
+    if (_options & BypassOptionKeychain) {
+        install_keychain_hooks();
+    }
+}
+
+- (void)swizzleLAContextMethods {
+    Class laContextClass = NSClassFromString(@"LAContext");
+    
+    if (!laContextClass) {
+        NSLog(@"[BiometricBypass] LAContext class not found");
+        return;
+    }
+    
+    // Swizzle canEvaluatePolicy:error:
+    Method originalCanEvaluate = class_getInstanceMethod(laContextClass, @selector(canEvaluatePolicy:error:));
+    Method swizzledCanEvaluate = class_getInstanceMethod([self class], @selector(swizzled_canEvaluatePolicy:error:));
+    
+    if (originalCanEvaluate && swizzledCanEvaluate) {
+        method_exchangeImplementations(originalCanEvaluate, swizzledCanEvaluate);
+    }
+    
+    // Swizzle evaluatePolicy:localizedReason:reply:
+    Method originalEvaluate = class_getInstanceMethod(laContextClass, @selector(evaluatePolicy:localizedReason:reply:));
+    Method swizzledEvaluate = class_getInstanceMethod([self class], @selector(swizzled_evaluatePolicy:localizedReason:reply:));
+    
+    if (originalEvaluate && swizzledEvaluate) {
+        method_exchangeImplementations(originalEvaluate, swizzledEvaluate);
+    }
+    
+    // Swizzle biometryType
+    Method originalBiometryType = class_getInstanceMethod(laContextClass, @selector(biometryType));
+    Method swizzledBiometryType = class_getInstanceMethod([self class], @selector(swizzled_biometryType));
+    
+    if (originalBiometryType && swizzledBiometryType) {
+        method_exchangeImplementations(originalBiometryType, swizzledBiometryType);
+    }
+    
+    NSLog(@"[BiometricBypass] LAContext hooks installed");
+}
+
+#pragma mark - Swizzled Methods
+
+- (BOOL)swizzled_canEvaluatePolicy:(LAPolicy)policy error:(NSError * __autoreleasing *)error {
+    // Always return YES for biometric policies when bypass is enabled
+    if (_enabled && (policy == LAPolicyDeviceOwnerAuthenticationWithBiometrics || 
+                     policy == LAPolicyDeviceOwnerAuthentication)) {
+        return YES;
+    }
+    
+    // Call original implementation for other policies
+    return [self swizzled_canEvaluatePolicy:policy error:error];
+}
+
+- (void)swizzled_evaluatePolicy:(LAPolicy)policy localizedReason:(NSString *)localizedReason reply:(void(^)(BOOL success, NSError *error))reply {
+    
+    if (_enabled && (policy == LAPolicyDeviceOwnerAuthenticationWithBiometrics || 
+                     policy == LAPolicyDeviceOwnerAuthentication)) {
+        
+        BOOL shouldSucceed = [[SecureEnclaveMock shared] simulateSuccess];
+        
+        // Simulate successful authentication immediately
+        if (reply) {
+            if (shouldSucceed) {
+                reply(YES, nil);
+            } else {
+                NSError *error = [NSError errorWithDomain:@"com.biometricbypass" 
+                                                     code:kLAErrorAuthenticationFailed 
+                                                 userInfo:@{NSLocalizedDescriptionKey: @"Biometric authentication failed (simulated)"}];
+                reply(NO, error);
+            }
+        }
+        return;
+    }
+    
+    // Call original implementation for other policies
+    [self swizzled_evaluatePolicy:policy localizedReason:localizedReason reply:reply];
+}
+
+- (LABiometryType)swizzled_biometryType {
+    // Return Touch ID by default, but can be configured
+    if (_enabled) {
+        return LABiometryTypeTouchID;
+    }
+    
+    return [self swizzled_biometryType];
+}
+
+#pragma mark - Keychain Mocking
+
++ (void)mockKeychainItem:(NSDictionary *)item forQuery:(NSDictionary *)query {
+    [[SecureEnclaveMock shared] mockItem:item forQuery:query];
+}
+
++ (void)clearMockedKeychain {
+    [[SecureEnclaveMock shared] clearAllItems];
+}
 
 @end
 
-// Convenience macros for testing
-#define BYPASS_BIOMETRICS [BiometricBypass configureWithOptions:BypassOptionBiometrics]
-#define BYPASS_KEYCHAIN [BiometricBypass configureWithOptions:BypassOptionKeychain]
-#define BYPASS_ALL [BiometricBypass configureWithOptions:BypassOptionAll]
-#define DISABLE_BYPASS [BiometricBypass setEnabled:NO]
-
-NS_ASSUME_NONNULL_END
+// Constructor that runs when the framework loads
+__attribute__((constructor))
+static void initializeBiometricBypass() {
+    NSLog(@"[BiometricBypass] Framework loaded, installing hooks...");
+    
+    // Check for environment variable to auto-enable
+    char *envEnabled = getenv("BIOMETRIC_BYPASS_ENABLED");
+    if (envEnabled && strcmp(envEnabled, "1") == 0) {
+        [BiometricBypass configureWithOptions:BypassOptionAll];
+        [BiometricBypass setEnabled:YES];
+        NSLog(@"[BiometricBypass] Auto-enabled via environment variable");
+    }
+}
