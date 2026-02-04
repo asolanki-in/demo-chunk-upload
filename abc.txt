@@ -1,101 +1,44 @@
-#!/usr/bin/env python3
-import subprocess
-import sys
-import os
-import xml.etree.ElementTree as ET
+#import <Foundation/Foundation.h>
+#import <LocalAuthentication/LocalAuthentication.h>
+#import <Security/Security.h>
 
-def run_cmd(cmd):
-    try:
-        return subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode()
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] {' '.join(cmd)} failed:\n{e.output.decode()}")
-        sys.exit(1)
+NS_ASSUME_NONNULL_BEGIN
 
-def export_time_profile_xml(trace_path, out_xml='time_profile.xml'):
-    print(f"[INFO] Exporting time-profile XML…")
-    cmd = [
-        "xcrun", "xctrace", "export",
-        "--input", trace_path,
-        "--xpath", '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]',
-        "--output", out_xml
-    ]
-    run_cmd(cmd)
-    return out_xml
+// Configuration flags
+typedef NS_OPTIONS(NSUInteger, BypassOptions) {
+    BypassOptionNone = 0,
+    BypassOptionBiometrics = 1 << 0,
+    BypassOptionKeychain = 1 << 1,
+    BypassOptionAll = BypassOptionBiometrics | BypassOptionKeychain
+};
 
-def parse_addresses_and_binaries(xml_path):
-    print(f"[INFO] Parsing addresses + binary UUIDs from XML…")
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
+@interface BiometricBypass : NSObject
 
-    # Map: {uuid: set(addresses)}
-    binary_map = {}
+// Singleton instance
++ (instancetype)shared;
 
-    for row in root.findall(".//row"):
-        uuid_elem = row.find(".//binary-uuid")
-        addr_elems = row.findall(".//text-addresses")
+// Configure bypass options
++ (void)configureWithOptions:(BypassOptions)options;
 
-        if uuid_elem is not None and addr_elems:
-            uuid = uuid_elem.text.strip().lower()
-            addrs = set()
-            for ta in addr_elems:
-                for addr in ta.text.split():
-                    addrs.add(addr)
-            if uuid not in binary_map:
-                binary_map[uuid] = set()
-            binary_map[uuid].update(addrs)
+// Enable/disable bypass at runtime
++ (void)setEnabled:(BOOL)enabled;
 
-    print(f"[INFO] Found {len(binary_map)} binaries with addresses")
-    return binary_map
+// Check if bypass is active
++ (BOOL)isEnabled;
 
-def get_dsym_uuids(dsym_dir):
-    uuids = {}
-    for root, dirs, files in os.walk(dsym_dir):
-        for f in files:
-            if f.endswith(".dSYM"):
-                dsym_path = os.path.join(root, f)
-                try:
-                    out = subprocess.check_output(
-                        ["dwarfdump", "--uuid", dsym_path],
-                        stderr=subprocess.DEVNULL
-                    ).decode()
-                    for line in out.splitlines():
-                        parts = line.strip().split()
-                        if len(parts) >= 3:
-                            uuid, arch = parts[1].lower(), parts[2]
-                            uuids[uuid] = (dsym_path, arch)
-                except Exception:
-                    pass
-    print(f"[INFO] Found {len(uuids)} dSYM UUIDs locally")
-    return uuids
+// Simulate biometric authentication
++ (BOOL)simulateBiometricSuccess:(BOOL)success;
 
-def symbolicate_address(addr, dsym_path, arch):
-    cmd = ["atos", "-o", dsym_path, "-arch", arch, addr]
-    try:
-        output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
-        return output if output else "<no symbol>"
-    except subprocess.CalledProcessError:
-        return "<symbolication failed>"
+// Keychain mocking
++ (void)mockKeychainItem:(NSDictionary *)item forQuery:(NSDictionary *)query;
++ (void)clearMockedKeychain;
 
-def main():
-    if len(sys.argv) != 3:
-        print("Usage: script.py <trace.trace> <dSYMs_dir>")
-        sys.exit(1)
+@end
 
-    trace, dsym_dir = sys.argv[1], sys.argv[2]
-    xml_path = export_time_profile_xml(trace)
-    binary_map = parse_addresses_and_binaries(xml_path)
-    dsym_uuids = get_dsym_uuids(dsym_dir)
+// Convenience macros for testing
+#define BYPASS_BIOMETRICS [BiometricBypass configureWithOptions:BypassOptionBiometrics]
+#define BYPASS_KEYCHAIN [BiometricBypass configureWithOptions:BypassOptionKeychain]
+#define BYPASS_ALL [BiometricBypass configureWithOptions:BypassOptionAll]
+#define DISABLE_BYPASS [BiometricBypass setEnabled:NO]
 
-    for uuid, addresses in binary_map.items():
-        if uuid not in dsym_uuids:
-            print(f"[SKIP] No dSYM for {uuid}, skipping {len(addresses)} addresses")
-            continue
-
-        dsym_path, arch = dsym_uuids[uuid]
-        print(f"[INFO] Symbolicating {len(addresses)} addresses for UUID {uuid} ({arch})")
-        for addr in sorted(addresses):
-            symbol = symbolicate_address(addr, dsym_path, arch)
-            print(f"{uuid}:{addr} → {symbol}")
-
-if __name__ == "__main__":
-    main()
+NS_ASSUME_NONNULL_END
